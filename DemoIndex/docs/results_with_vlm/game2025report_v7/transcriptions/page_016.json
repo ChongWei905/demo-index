@@ -1,0 +1,17 @@
+{
+  "page_number": 16,
+  "page_markdown": "第 1 部分\n\n# 掌握颠覆性洞见，驱动极致影响力\n\n## 热门应用，安装、会话和留存率\n\n![img-14.jpeg]",
+  "headings": [
+    {
+      "title": "掌握颠覆性洞见，驱动极致影响力",
+      "level_hint": 1,
+      "role": "section"
+    },
+    {
+      "title": "热门应用，安装、会话和留存率",
+      "level_hint": 2,
+      "role": "subsection"
+    }
+  ],
+  "model": "qwen3.6-plus"
+}

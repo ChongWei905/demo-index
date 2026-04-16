@@ -1,0 +1,17 @@
+{
+  "page_number": 35,
+  "page_markdown": "第 3 部分\n\n# 收入流\n\n## 每用户平均收入\n\nimg-40.jpeg",
+  "headings": [
+    {
+      "title": "收入流",
+      "level_hint": 1,
+      "role": "section"
+    },
+    {
+      "title": "每用户平均收入",
+      "level_hint": 2,
+      "role": "subsection"
+    }
+  ],
+  "model": "qwen3.6-plus"
+}

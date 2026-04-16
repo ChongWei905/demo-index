@@ -1,0 +1,121 @@
+{
+  "actual_root_titles": [
+    "2025年游戏应用洞察报告",
+    "研究方法",
+    "关键看点",
+    "掌握颠覆性洞见，驱动极致影响力",
+    "揭秘成本与表现数据",
+    "收入流"
+  ],
+  "expected_root_titles": [
+    "2025年游戏应用洞察报告",
+    "2024年移动游戏领域增长概况",
+    "研究方法",
+    "关键看点",
+    "掌握颠覆性洞见，驱动极致影响力",
+    "揭秘成本与表现数据",
+    "收入流"
+  ],
+  "top_level_schema_match": true,
+  "actual_node_count": 24,
+  "expected_node_count": 27,
+  "matched_title_count": 19,
+  "title_precision": 0.7917,
+  "title_recall": 0.7037,
+  "page_match_ratio_within_one": 1.0,
+  "missing_titles": [
+    "2023-2024年全球及区域游戏应用市场表现分析",
+    "2024 Mobile Game Download Rankings and Genre Performance Analysis",
+    "2024 年移动游戏下载量 TOP 10",
+    "Game App CPM and Partnership Trends",
+    "Game App Cost and Performance Trends: IPM, CPC, and CPI Analysis (2023-2024)",
+    "Game App Performance Metrics: CPI, CTR, and CPM Trends (2023-2024)",
+    "Game App Performance: Session Duration, User Sessions, and Retention (2023-2024)",
+    "第2部分"
+  ],
+  "unexpected_titles": [
+    "2024年移动游戏下载量 TOP 10",
+    "新兴用户获取渠道推动增长",
+    "每用户平均收入",
+    "热门应用，安装、会话和留存率",
+    "跨平台游戏主要优势"
+  ],
+  "page_mismatches": [],
+  "text_length_examples": [
+    {
+      "title": "2024年移动游戏领域增长概况",
+      "actual_text_length": 528,
+      "expected_text_length": 513
+    },
+    {
+      "title": "2025年游戏应用洞察报告",
+      "actual_text_length": 108,
+      "expected_text_length": 159
+    },
+    {
+      "title": "2025年玩出大获全胜",
+      "actual_text_length": 876,
+      "expected_text_length": 878
+    },
+    {
+      "title": "AI 助力游戏开发",
+      "actual_text_length": 255,
+      "expected_text_length": 257
+    },
+    {
+      "title": "AI 应用变现：让游戏经济焕新",
+      "actual_text_length": 177,
+      "expected_text_length": 180
+    },
+    {
+      "title": "AI 驱动个性化和用户留存",
+      "actual_text_length": 269,
+      "expected_text_length": 277
+    },
+    {
+      "title": "关键看点",
+      "actual_text_length": 445,
+      "expected_text_length": 667
+    },
+    {
+      "title": "在隐私安全挑战和移动游戏表现之间寻求平衡",
+      "actual_text_length": 881,
+      "expected_text_length": 684
+    },
+    {
+      "title": "开启游戏发现新时代",
+      "actual_text_length": 185,
+      "expected_text_length": 891
+    },
+    {
+      "title": "掌握颠覆性洞见，驱动极致影响力",
+      "actual_text_length": 17,
+      "expected_text_length": 78
+    },
+    {
+      "title": "揭秘成本与表现数据",
+      "actual_text_length": 3450,
+      "expected_text_length": 85
+    },
+    {
+      "title": "收入流",
+      "actual_text_length": 5,
+      "expected_text_length": 1583
+    },
+    {
+      "title": "游戏开始！AI 让移动游戏领域智能化程度更高、交互更强劲",
+      "actual_text_length": 133,
+      "expected_text_length": 135
+    },
+    {
+      "title": "用户获取和营销中的 AI",
+      "actual_text_length": 515,
+      "expected_text_length": 517
+    },
+    {
+      "title": "目录",
+      "actual_text_length": 398,
+      "expected_text_length": 344
+    }
+  ]
+}
