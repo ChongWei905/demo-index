@@ -1,28 +1,20 @@
-"""Main pipeline for DemoIndex."""
+"""PageIndex-aligned pipeline for DemoIndex."""
 
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
-import hashlib
 import json
-import os
-import re
+import hashlib
 import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from .env import PAGEINDEX_ROOT, REPO_ROOT, ensure_pageindex_import_path, load_dashscope_api_key
-from .llm import DashScopeVisionClient
-from .models import OutlineEntry, PageArtifact, PageTranscription
-from .pdf import (
-    extract_outline_entries,
-    extract_page_artifacts,
-    layout_heading_candidates,
-    normalize_text,
-    outline_window_for_page,
-)
+from dotenv import load_dotenv
+
+from .env import PAGEINDEX_ROOT, REPO_ROOT, ensure_pageindex_import_path
+from .llm import QwenChatClient
+from .pdf import extract_outline_entries, extract_page_artifacts, layout_heading_candidates, normalize_text
 
 
 def build_pageindex_tree(
@@ -32,9 +24,14 @@ def build_pageindex_tree(
     model: str = "dashscope/qwen3.6-plus",
     fallback_model: str = "dashscope/qwen3.5-plus",
 ) -> dict[str, Any]:
-    """Build a PageIndex-style tree JSON from one PDF."""
+    """Build a target-format tree by reusing PageIndex's PDF processing flow."""
     ensure_pageindex_import_path()
-    from pageindex.page_index_md import md_to_tree
+    _load_pageindex_env()
+
+    pageindex_module, utils_module, config_loader = _patch_pageindex_llm(
+        model=model,
+        fallback_model=fallback_model,
+    )
 
     resolved_pdf_path = Path(pdf_path).expanduser().resolve()
     if not resolved_pdf_path.exists():
@@ -46,106 +43,51 @@ def build_pageindex_tree(
         else REPO_ROOT / "DemoIndex" / "artifacts" / resolved_pdf_path.stem
     )
     artifact_root.mkdir(parents=True, exist_ok=True)
-    (artifact_root / "transcriptions").mkdir(parents=True, exist_ok=True)
-    (artifact_root / "markdown_pages").mkdir(parents=True, exist_ok=True)
 
-    api_key = load_dashscope_api_key()
-    pages = extract_page_artifacts(resolved_pdf_path, artifact_root)
-    toc_page_number, outline_entries = extract_outline_entries(pages)
+    opt = config_loader.load(
+        {
+            "model": model,
+            "if_add_node_id": "yes",
+            "if_add_node_summary": "no",
+            "if_add_doc_description": "no",
+            "if_add_node_text": "yes",
+        }
+    )
+    page_list = utils_module.get_page_tokens(str(resolved_pdf_path), model=model)
+    page_artifacts = extract_page_artifacts(resolved_pdf_path, artifact_root)
+    toc_page_number, outline_entries = extract_outline_entries(page_artifacts)
     _save_json(artifact_root / "outline_entries.json", [asdict(entry) for entry in outline_entries])
 
-    client = DashScopeVisionClient(
-        api_key=api_key,
-        model=model,
-        fallback_model=fallback_model,
-        timeout_seconds=75.0,
-        max_retries=2,
-    )
-
-    transcriptions_by_page: dict[int, PageTranscription] = {}
-    pages_to_transcribe: list[PageArtifact] = []
-    for page in pages:
-        cached = _load_cached_transcription(artifact_root, page.page_number)
-        if cached is not None:
-            print(f"[cache] page {page.page_number}/{len(pages)}", flush=True)
-            transcriptions_by_page[page.page_number] = cached
-            continue
-        rule_based_transcription = _build_rule_based_transcription(
-            page=page,
-            toc_page_number=toc_page_number,
-            outline_entries=outline_entries,
-        )
-        if rule_based_transcription is not None:
-            print(f"[rule] page {page.page_number}/{len(pages)}", flush=True)
-            _save_json(
-                artifact_root / "transcriptions" / f"page_{page.page_number:03d}.json",
-                {
-                    "page_number": rule_based_transcription.page_number,
-                    "page_markdown": rule_based_transcription.page_markdown,
-                    "headings": rule_based_transcription.headings,
-                    "model": rule_based_transcription.model,
-                },
-            )
-            transcriptions_by_page[page.page_number] = rule_based_transcription
-            continue
-        pages_to_transcribe.append(page)
-
-    if pages_to_transcribe:
-        max_workers = min(3, len(pages_to_transcribe))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    _transcribe_page,
-                    client=client,
-                    page=page,
-                    toc_page_number=toc_page_number,
-                    outline_entries=outline_entries,
-                ): page
-                for page in pages_to_transcribe
-            }
-            for future in concurrent.futures.as_completed(futures):
-                page = futures[future]
-                transcription = future.result()
-                print(f"[done] page {page.page_number}/{len(pages)}", flush=True)
-                _save_json(
-                    artifact_root / "transcriptions" / f"page_{page.page_number:03d}.json",
-                    {
-                        "page_number": transcription.page_number,
-                        "page_markdown": transcription.page_markdown,
-                        "headings": transcription.headings,
-                        "model": transcription.model,
-                    },
-                )
-                transcriptions_by_page[page.page_number] = transcription
-
-    transcriptions = [transcriptions_by_page[page.page_number] for page in pages]
-
-    combined_markdown, line_to_page = _normalize_and_merge_markdown(
-        pages=pages,
-        transcriptions=transcriptions,
+    seeded_outline = _build_seeded_outline(
+        page_artifacts=page_artifacts,
         outline_entries=outline_entries,
         toc_page_number=toc_page_number,
-        artifact_root=artifact_root,
     )
-    combined_markdown_path = artifact_root / "combined_document.md"
-    combined_markdown_path.write_text(combined_markdown, encoding="utf-8")
+    _save_json(artifact_root / "seeded_outline.json", seeded_outline)
 
-    tree_result = asyncio.run(
-        md_to_tree(
-            md_path=str(combined_markdown_path),
-            if_thinning=False,
-            if_add_node_summary="no",
-            if_add_doc_description="no",
-            if_add_node_text="yes",
-            if_add_node_id="yes",
+    tree = asyncio.run(
+        _build_tree_from_seeded_outline(
+            seeded_outline=seeded_outline,
+            page_list=page_list,
+            pageindex_module=pageindex_module,
+            utils_module=utils_module,
+            opt=opt,
         )
     )
-    tree = tree_result["structure"]
+    utils_module.write_node_id(tree)
+    utils_module.add_node_text(tree, page_list)
+
+    raw_result = {
+        "doc_name": resolved_pdf_path.name,
+        "structure": tree,
+    }
+    _save_json(artifact_root / "pageindex_raw.json", raw_result)
+
     output = {
         "doc_id": _stable_doc_id(resolved_pdf_path),
         "status": "completed",
         "retrieval_ready": False,
-        "result": _convert_tree(tree, line_to_page),
+        "result": _convert_pageindex_structure(raw_result.get("structure") or []),
     }
 
     target_output_path = (
@@ -155,6 +97,32 @@ def build_pageindex_tree(
     )
     _save_json(target_output_path, output)
     return output
+
+
+async def _build_tree_from_seeded_outline(
+    *,
+    seeded_outline: list[dict[str, Any]],
+    page_list: list[tuple[str, int]],
+    pageindex_module,
+    utils_module,
+    opt,
+) -> list[dict[str, Any]]:
+    """Build a tree from a seeded top-level outline using PageIndex recursion."""
+    logger = _NullLogger()
+    outline_with_start_flags = await pageindex_module.check_title_appearance_in_start_concurrent(
+        seeded_outline,
+        page_list,
+        model=opt.model,
+        logger=logger,
+    )
+    valid_outline = [item for item in outline_with_start_flags if item.get("physical_index") is not None]
+    tree = utils_module.post_processing(valid_outline, len(page_list))
+    tasks = [
+        pageindex_module.process_large_node_recursively(node, page_list, opt=opt, logger=logger)
+        for node in tree
+    ]
+    await asyncio.gather(*tasks)
+    return tree
 
 
 def compare_tree(actual_json: str, expected_json: str) -> dict[str, Any]:
@@ -193,7 +161,7 @@ def compare_tree(actual_json: str, expected_json: str) -> dict[str, Any]:
                 }
             )
 
-    report = {
+    return {
         "actual_root_titles": [node["title"] for node in actual.get("result") or []],
         "expected_root_titles": [node["title"] for node in expected.get("result") or []],
         "top_level_schema_match": list(actual.keys()) == list(expected.keys()),
@@ -215,169 +183,151 @@ def compare_tree(actual_json: str, expected_json: str) -> dict[str, Any]:
             for title in matched_titles[:15]
         ],
     }
-    return report
 
 
-def _normalize_and_merge_markdown(
-    *,
-    pages: list[PageArtifact],
-    transcriptions: list[PageTranscription],
-    outline_entries: list[OutlineEntry],
-    toc_page_number: int | None,
-    artifact_root: Path,
-) -> tuple[str, dict[int, int]]:
-    """Normalize heading levels, save per-page markdown, and merge into one document."""
-    base_offset = 1 if toc_page_number and toc_page_number > 1 else 0
-    toc_by_title: dict[str, OutlineEntry] = {normalize_text(entry.title): entry for entry in outline_entries}
-    top_level_entries = sorted(
-        [entry for entry in outline_entries if entry.level_hint == 1 and entry.physical_page is not None],
-        key=lambda item: int(item.physical_page or 0),
+def _load_pageindex_env() -> None:
+    """Load environment variables from PageIndex's local `.env` file."""
+    env_path = PAGEINDEX_ROOT / ".env"
+    if env_path.exists():
+        load_dotenv(env_path, override=False)
+
+
+def _patch_pageindex_llm(model: str, fallback_model: str | None):
+    """Patch PageIndex modules to use the local qwen-compatible client."""
+    import importlib
+
+    pageindex_module = importlib.import_module("pageindex.page_index")
+    utils_module = importlib.import_module("pageindex.utils")
+
+    client = QwenChatClient(
+        primary_model=model,
+        fallback_model=fallback_model,
+        timeout_seconds=min(120.0, float(utils_module._get_llm_timeout_seconds())),
+        max_retries=min(3, int(utils_module._get_llm_max_retries())),
+        max_concurrency=int(utils_module._get_llm_max_concurrency()),
     )
-    cover_child_root_title = normalize_text(top_level_entries[0].title) if base_offset and top_level_entries else None
-    line_to_page: dict[int, int] = {}
-    markdown_chunks: list[str] = []
-
-    for page, transcription in zip(pages, transcriptions, strict=True):
-        normalized_markdown = _normalize_page_markdown(
-            page=page,
-            transcription=transcription,
-            toc_page_number=toc_page_number,
-            toc_by_title=toc_by_title,
-            base_offset=base_offset,
-            top_level_entries=top_level_entries,
-            cover_child_root_title=cover_child_root_title,
-        )
-        page_output_path = artifact_root / "markdown_pages" / f"page_{page.page_number:03d}.md"
-        page_output_path.write_text(normalized_markdown + "\n", encoding="utf-8")
-        if normalized_markdown.strip():
-            markdown_chunks.append(f"<!-- page:{page.page_number} -->\n{normalized_markdown}")
-
-    combined_markdown = "\n\n".join(markdown_chunks)
-    current_page: int | None = None
-    for line_number, line in enumerate(combined_markdown.splitlines(), start=1):
-        stripped = line.strip()
-        if stripped.startswith("<!-- page:") and stripped.endswith("-->"):
-            try:
-                current_page = int(stripped.removeprefix("<!-- page:").removesuffix(" -->"))
-            except ValueError:
-                current_page = None
-            continue
-        if stripped.startswith("#") and current_page is not None:
-            line_to_page[line_number] = current_page
-
-    return combined_markdown, line_to_page
+    utils_module.llm_completion = client.completion
+    utils_module.llm_acompletion = client.acompletion
+    pageindex_module.llm_completion = client.completion
+    pageindex_module.llm_acompletion = client.acompletion
+    return pageindex_module, utils_module, utils_module.ConfigLoader()
 
 
-def _normalize_page_markdown(
+def _build_seeded_outline(
     *,
-    page: PageArtifact,
-    transcription: PageTranscription,
+    page_artifacts,
+    outline_entries,
     toc_page_number: int | None,
-    toc_by_title: dict[str, OutlineEntry],
-    base_offset: int,
-    top_level_entries: list[OutlineEntry],
-    cover_child_root_title: str | None,
-) -> str:
-    """Rewrite heading levels in one page markdown according to generic rules."""
-    markdown_lines = transcription.page_markdown.splitlines()
-    layout_candidates = layout_heading_candidates(page)
-    layout_sizes = {normalize_text(item["title"]): float(item["size"]) for item in layout_candidates}
-    heading_titles = _extract_heading_titles(markdown_lines)
-    metadata_titles = [
-        str(item.get("title", "")).strip()
-        for item in transcription.headings
-        if str(item.get("title", "")).strip()
-    ]
-    if metadata_titles:
-        heading_titles = metadata_titles
+) -> list[dict[str, Any]]:
+    """Build a seeded outline that mirrors PageIndex's flat TOC item format."""
+    seeded: list[dict[str, Any]] = []
+    cover_title = _extract_cover_title(page_artifacts)
+    include_cover = bool(cover_title and toc_page_number and toc_page_number > 1)
+    include_toc = bool(include_cover and toc_page_number is not None)
 
-    page_role = "content"
-    if toc_page_number and page.page_number < toc_page_number:
-        page_role = "cover"
-    elif toc_page_number and page.page_number == toc_page_number:
-        page_role = "toc"
+    if include_cover:
+        seeded.append({"structure": "0", "title": cover_title, "physical_index": 1})
+    if include_toc and toc_page_number is not None:
+        seeded.append({"structure": "0.1", "title": "目录", "physical_index": toc_page_number})
 
-    normalized_levels: dict[str, int] = {}
-    previous_level: int | None = None
-    for index, title in enumerate(heading_titles):
-        normalized = normalize_text(title)
-        toc_entry = toc_by_title.get(normalized)
-        active_root = _active_top_level_entry(top_level_entries, page.page_number)
-        root_offset = int(
-            bool(
-                cover_child_root_title
-                and active_root is not None
-                and normalize_text(active_root.title) == cover_child_root_title
-            )
+    counters: list[int] = []
+    top_level_seed = 1 if include_toc else 0
+    for entry in outline_entries:
+        if entry.physical_page is None:
+            continue
+        level = _effective_outline_level(entry, page_artifacts)
+        while len(counters) < level:
+            counters.append(0)
+        counters = counters[:level]
+        if level == 1 and counters[0] == 0:
+            counters[0] = top_level_seed
+        counters[-1] += 1
+        structure_parts = [str(value) for value in counters]
+        if include_cover:
+            structure = ".".join(["0", *structure_parts])
+        else:
+            structure = ".".join(structure_parts)
+        seeded.append(
+            {
+                "structure": structure,
+                "title": _resolved_entry_title(entry, page_artifacts),
+                "physical_index": entry.physical_page,
+            }
         )
-        if page_role == "cover" and index == 0:
-            level = 1
-        elif page_role == "toc" and "目录" in title:
-            level = 2 if base_offset else 1
-        elif toc_entry is not None:
-            heading_size = layout_sizes.get(normalized, 0.0)
-            if toc_entry.level_hint == 1:
-                if index > 0 and previous_level is not None:
-                    level = previous_level
-                else:
-                    level = 2 if root_offset else 1
-            elif index == 0 and heading_size >= 32.0:
-                level = 1
-            else:
-                level = min(6, toc_entry.level_hint + root_offset)
-        elif previous_level is not None:
-            level = min(6, previous_level + 1)
-        else:
-            level = 2 if base_offset else 1
-        normalized_levels[normalized] = level
-        previous_level = level
-
-    rewritten: list[str] = []
-    for line in markdown_lines:
-        stripped = line.lstrip()
-        if stripped.startswith("#"):
-            title = stripped.lstrip("#").strip()
-            normalized = normalize_text(title)
-            toc_entry = toc_by_title.get(normalized)
-            if _should_demote_heading(title, toc_entry):
-                rewritten.append(title)
-                continue
-            level = normalized_levels.get(normalized, 2 if base_offset else 1)
-            rewritten.append("#" * level + " " + title)
-        else:
-            rewritten.append(line)
-    return "\n".join(rewritten).strip()
+    return seeded
 
 
-def _extract_heading_titles(lines: list[str]) -> list[str]:
-    """Collect markdown heading titles in order."""
-    titles: list[str] = []
-    for line in lines:
-        stripped = line.lstrip()
-        if stripped.startswith("#"):
-            titles.append(stripped.lstrip("#").strip())
-    return titles
+def _extract_cover_title(page_artifacts) -> str | None:
+    """Extract a likely cover title from the first page."""
+    if not page_artifacts:
+        return None
+    prominent_lines = [
+        " ".join(line_text.split()).strip()
+        for line_text, bbox in page_artifacts[0].lines
+        if bbox[1] < 260 and len(" ".join(line_text.split()).strip()) <= 20
+    ]
+    if len(prominent_lines) >= 2:
+        combined = "".join(prominent_lines[:2]).strip()
+        if len(combined) >= 8:
+            return combined
+    candidates = layout_heading_candidates(page_artifacts[0], limit=3)
+    if candidates:
+        return str(candidates[0]["title"]).strip()
+    for line_text, _bbox in page_artifacts[0].lines:
+        cleaned = " ".join(line_text.split()).strip()
+        if len(cleaned) >= 4:
+            return cleaned
+    return None
 
 
-def _convert_tree(tree: list[dict[str, Any]], line_to_page: dict[int, int]) -> list[dict[str, Any]]:
-    """Convert a markdown tree into the target JSON structure."""
-    counter = 0
+def _effective_outline_level(entry, page_artifacts) -> int:
+    """Adjust TOC indentation levels using the actual page heading scale."""
+    level = max(1, int(entry.level_hint))
+    if entry.physical_page is None or entry.physical_page > len(page_artifacts):
+        return level
+    page = page_artifacts[int(entry.physical_page) - 1]
+    dominant_title, dominant_size = _page_dominant_heading(page)
+    if (
+        dominant_title
+        and dominant_size >= 32.0
+        and (
+            normalize_text(entry.title) in normalize_text(dominant_title)
+            or normalize_text(dominant_title) in normalize_text(entry.title)
+        )
+    ):
+        return 1
+    return level
 
-    def convert_node(node: dict[str, Any]) -> dict[str, Any]:
-        nonlocal counter
-        converted = {
+
+def _page_dominant_heading(page_artifact) -> tuple[str | None, float]:
+    """Return the dominant heading text and size for one page."""
+    candidates = layout_heading_candidates(page_artifact, limit=5)
+    if not candidates:
+        return None, 0.0
+    max_size = max(float(item["size"]) for item in candidates)
+    dominant_parts = [
+        str(item["title"]).strip()
+        for item in candidates
+        if float(item["size"]) >= max_size * 0.95
+    ]
+    return "".join(dominant_parts).strip() or None, max_size
+
+
+def _convert_pageindex_structure(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert PageIndex's PDF structure into the target JSON schema."""
+    converted: list[dict[str, Any]] = []
+    for node in nodes:
+        item = {
             "title": _sanitize_output_title(str(node.get("title") or "")),
-            "node_id": f"{counter:04d}",
-            "page_index": line_to_page.get(int(node.get("line_num", 0))),
+            "node_id": node.get("node_id"),
+            "page_index": node.get("start_index"),
             "text": node.get("text", ""),
         }
-        counter += 1
-        children = [convert_node(child) for child in node.get("nodes") or []]
+        children = _convert_pageindex_structure(node.get("nodes") or [])
         if children:
-            converted["nodes"] = children
-        return converted
-
-    return [convert_node(node) for node in tree]
+            item["nodes"] = children
+        converted.append(item)
+    return _reshape_root_nodes(converted)
 
 
 def _flatten_tree(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -395,24 +345,16 @@ def _flatten_tree(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return flattened
 
 
-def _load_cached_transcription(artifact_root: Path, page_number: int) -> PageTranscription | None:
-    """Load a cached page transcription if it exists."""
-    path = artifact_root / "transcriptions" / f"page_{page_number:03d}.json"
-    if not path.exists():
-        return None
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    return PageTranscription(
-        page_number=int(payload["page_number"]),
-        page_markdown=str(payload["page_markdown"]),
-        headings=list(payload.get("headings") or []),
-        model=str(payload.get("model") or ""),
-    )
-
-
 def _save_json(path: Path, payload: Any) -> None:
     """Write a JSON payload to disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _stable_doc_id(pdf_path: Path) -> str:
+    """Build a stable document id from PDF content."""
+    digest = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, digest))
 
 
 def _ratio(numerator: int, denominator: int) -> float:
@@ -422,149 +364,82 @@ def _ratio(numerator: int, denominator: int) -> float:
     return round(numerator / denominator, 4)
 
 
-def _stable_doc_id(pdf_path: Path) -> str:
-    """Build a stable document id from PDF content."""
-    digest = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, digest))
-
-
-def _active_top_level_entry(
-    top_level_entries: list[OutlineEntry], page_number: int
-) -> OutlineEntry | None:
-    """Return the active top-level TOC entry for one physical page."""
-    active: OutlineEntry | None = None
-    for entry in top_level_entries:
-        if entry.physical_page is None:
-            continue
-        if int(entry.physical_page) <= page_number:
-            active = entry
-        else:
-            break
-    return active
-
-
 def _sanitize_output_title(title: str) -> str:
     """Apply lightweight title cleanup for final tree output."""
     cleaned = " ".join(title.split())
-    cleaned = re.sub(r"(?<=\d)\s+(?=[年月日])", "", cleaned)
-    cleaned = re.sub(r"^前言[:：]\s*", "", cleaned)
+    cleaned = _collapse_cjk_spaces(cleaned)
+    if cleaned.startswith("前言："):
+        return cleaned.removeprefix("前言：").strip()
+    if cleaned.startswith("前言:"):
+        return cleaned.removeprefix("前言:").strip()
     return cleaned
 
 
-def _should_demote_heading(title: str, toc_entry: OutlineEntry | None) -> bool:
-    """Return whether a markdown heading should be demoted to plain text."""
-    if toc_entry is not None:
+def _collapse_cjk_spaces(text: str) -> str:
+    """Remove spaces inside titles when both neighbors are CJK, digits, or punctuation."""
+    collapsed: list[str] = []
+    for index, char in enumerate(text):
+        if char != " ":
+            collapsed.append(char)
+            continue
+        prev_char = text[index - 1] if index > 0 else ""
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        if _is_cjkish(prev_char) and _is_cjkish(next_char):
+            continue
+        collapsed.append(char)
+    return "".join(collapsed).strip()
+
+
+def _is_cjkish(char: str) -> bool:
+    """Return whether a character belongs to a CJK-ish title token set."""
+    if not char:
         return False
-    if title in {"ADJUST 为您助力：", "游戏应用洞察报告"}:
-        return True
-    caption_terms = (
-        "全球",
-        "各国家",
-        "各地区",
-        "同比增长率",
-        "每款",
-        "每用户",
-        "付费/自然",
-        "会话时长",
-        "合作伙伴数量",
-        "ARP",
-        "CPI",
-        "CPM",
-        "CPC",
-        "IPM",
-        "ATT",
-    )
-    return any(term in title for term in caption_terms) and any(char.isdigit() for char in title)
+    return "\u4e00" <= char <= "\u9fff" or char.isdigit() or char in {"年", "月", "日", "！", "：", ":", "（", "）", "(", ")", "·"}
 
 
-def _transcribe_page(
-    *,
-    client: DashScopeVisionClient,
-    page: PageArtifact,
-    toc_page_number: int | None,
-    outline_entries: list[OutlineEntry],
-) -> PageTranscription:
-    """Transcribe one page with the shared client."""
-    print(f"[transcribe] page {page.page_number}", flush=True)
-    try:
-        return client.transcribe_page(
-            page=page,
-            toc_page_number=toc_page_number,
-            outline_entries=outline_window_for_page(outline_entries, page.page_number),
-            layout_candidates=layout_heading_candidates(page),
-        )
-    except Exception as exc:
-        print(f"[page-fallback] page {page.page_number}: {exc}", flush=True)
-        return _build_plaintext_fallback_transcription(page)
+def _reshape_root_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Promote main sections out of the cover root while keeping TOC and preface nested."""
+    if not nodes:
+        return nodes
+    first_root = nodes[0]
+    children = first_root.get("nodes") or []
+    if first_root.get("page_index") != 1 or len(children) < 3:
+        return nodes
+    if children[0].get("title") != "目录":
+        return nodes
+    first_root["nodes"] = children[:2]
+    return [first_root, *children[2:], *nodes[1:]]
 
 
-def _build_rule_based_transcription(
-    *,
-    page: PageArtifact,
-    toc_page_number: int | None,
-    outline_entries: list[OutlineEntry],
-) -> PageTranscription | None:
-    """Return a rule-based transcription for pages that do not need an LLM call."""
-    if page.page_number == toc_page_number and outline_entries:
-        toc_lines = ["## 目录", ""]
-        for entry in outline_entries:
-            if entry.printed_page is None:
-                toc_lines.append(f"- {entry.title}")
-            else:
-                toc_lines.append(f"- {entry.title} .... {entry.printed_page}")
-        return PageTranscription(
-            page_number=page.page_number,
-            page_markdown="\n".join(toc_lines).strip(),
-            headings=[{"title": "目录", "level_hint": 2, "role": "toc"}],
-            model="rule-based",
-        )
-
-    if not page.plain_text.strip() and page.visual_regions:
-        markdown = "\n\n".join(
-            f"![{region.placeholder_name}]({region.placeholder_name})"
-            for region in page.visual_regions
-        )
-        return PageTranscription(
-            page_number=page.page_number,
-            page_markdown=markdown,
-            headings=[],
-            model="rule-based",
-        )
-
-    if not page.plain_text.strip() and not page.visual_regions:
-        return PageTranscription(
-            page_number=page.page_number,
-            page_markdown="",
-            headings=[],
-            model="rule-based",
-        )
-    return None
+def _resolved_entry_title(entry, page_artifacts) -> str:
+    """Prefer the page-visible heading text when it clearly matches the TOC title."""
+    if entry.physical_page is None or entry.physical_page > len(page_artifacts):
+        return entry.title
+    dominant_title, dominant_size = _page_dominant_heading(page_artifacts[int(entry.physical_page) - 1])
+    if dominant_title and dominant_size >= 22.0 and _titles_share_prefix(entry.title, dominant_title):
+        return dominant_title
+    return entry.title
 
 
-def _build_plaintext_fallback_transcription(page: PageArtifact) -> PageTranscription:
-    """Build a lightweight fallback transcription from extracted text only."""
-    candidates = layout_heading_candidates(page, limit=3)
-    heading_title = candidates[0]["title"] if candidates else None
-    text = page.plain_text.strip()
-    parts: list[str] = []
-    headings: list[dict[str, Any]] = []
-    if heading_title:
-        parts.append(f"# {heading_title}")
-        headings.append({"title": heading_title, "level_hint": 1, "role": "section"})
-        normalized_heading = normalize_text(heading_title)
-        if text:
-            filtered = text
-            normalized_text = normalize_text(text)
-            if normalized_heading and normalized_heading in normalized_text:
-                filtered = filtered
-            parts.append(filtered)
-    elif text:
-        parts.append(text)
-    for region in page.visual_regions:
-        parts.append(f"![{region.placeholder_name}]({region.placeholder_name})")
-    return PageTranscription(
-        page_number=page.page_number,
-        page_markdown="\n\n".join(part for part in parts if part).strip(),
-        headings=headings,
-        model="plaintext-fallback",
-    )
+def _titles_share_prefix(left_title: str, right_title: str) -> bool:
+    """Return whether two titles likely refer to the same visible heading."""
+    left = normalize_text(left_title)
+    right = normalize_text(right_title)
+    shared = 0
+    for left_char, right_char in zip(left, right):
+        if left_char != right_char:
+            break
+        shared += 1
+    return shared >= 4
+
+
+class _NullLogger:
+    """A tiny logger compatible with the PageIndex call sites."""
+
+    def info(self, _message: Any) -> None:
+        """Ignore info logs."""
+        return None
+
+    def error(self, _message: Any) -> None:
+        """Ignore error logs."""
+        return None
