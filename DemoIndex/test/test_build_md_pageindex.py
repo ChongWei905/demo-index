@@ -1,4 +1,4 @@
-"""Tests for ``md_combined_pageindex`` (markdown forest, page comments, payloads)."""
+"""Tests for ``build_md_pageindex`` (markdown forest, page comments, payloads)."""
 
 from __future__ import annotations
 
@@ -8,18 +8,21 @@ from pathlib import Path
 
 import pytest
 
-from md_combined_pageindex import (
+from build_md_pageindex import (
     PageIndexOptions,
     assign_node_ids_preorder,
     build_forest_from_markdown,
+    build_forest_page_per_page_with_doc_root,
     build_tree_from_flat_nodes,
     compute_line_count,
     find_h1_line_indices,
+    group_line_ranges_by_page,
     iter_atx_headers,
     normalize_display_title,
     parse_page_comments,
     strip_internal_fields,
     sync_build_pageindex_payload,
+    sync_build_pageindex_payload_from_lines,
     _heuristic_doc_summary,
     _heuristic_node_summary,
 )
@@ -181,6 +184,59 @@ def test_heuristic_doc_summary_lists_roots() -> None:
     s = _heuristic_doc_summary(forest, line_count=10)
     assert "10" in s
     assert "第一章" in s and "第二章" in s
+
+
+def test_group_line_ranges_by_page() -> None:
+    assert group_line_ranges_by_page([1, 1, 2, 2]) == [(1, 0, 1), (2, 2, 3)]
+    assert group_line_ranges_by_page([3]) == [(3, 0, 0)]
+
+
+def test_build_forest_page_per_page_with_doc_root() -> None:
+    md = textwrap.dedent(
+        """\
+        <!-- page:1 -->
+        # RootTitle
+
+        intro
+
+        <!-- page:2 -->
+        ## PageTwoOnly
+        body
+        """
+    ).strip()
+    lines = md.split("\n")
+    pages = parse_page_comments(lines)
+    forest = build_forest_page_per_page_with_doc_root(lines, pages)
+    assert len(forest) == 1
+    root = forest[0]
+    assert root["title"] == "RootTitle"
+    assert "intro" in root["text"]
+    assert "## PageTwoOnly" not in root["text"]
+    kids = root["nodes"]
+    assert len(kids) == 2
+    assert kids[0]["page_index"] == 1
+    assert kids[0]["title"] == "RootTitle"
+    assert "intro" in kids[0]["text"]
+    assert kids[1]["page_index"] == 2
+    assert kids[1]["title"] == "PageTwoOnly"
+
+
+def test_sync_build_pageindex_payload_from_lines_page_per_page() -> None:
+    lines = [
+        "<!-- page:1 -->",
+        "# OnlyH1",
+        "",
+        "x",
+        "<!-- page:2 -->",
+        "no heading line",
+    ]
+    opt = PageIndexOptions(if_add_summary=False, doc_id="00000000-0000-0000-0000-000000000001")
+    p = sync_build_pageindex_payload_from_lines(lines, opt, llm_factory=None, layout="page_per_page")
+    assert len(p["result"]) == 1
+    root = p["result"][0]
+    assert root["title"] == "OnlyH1"
+    assert len(root["nodes"]) == 2
+    assert root["nodes"][1]["title"] == "no heading line"
 
 
 def test_sync_build_pageindex_payload_summary_off_clears_nodes(tmp_path: Path) -> None:

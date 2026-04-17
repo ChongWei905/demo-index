@@ -13,7 +13,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 PAGE_COMMENT_RE = re.compile(r"^\s*<!--\s*page:(\d+)\s*-->\s*$")
 ATX_HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
@@ -31,6 +31,8 @@ class PageIndexOptions:
         if_add_summary: 为 True 时填充顶层与各节点的 ``summary``（可走 LLM 或启发式）。
         summary_char_threshold: 节点正文短于此字符数时，摘要直接采用正文或标题，不调模型。
         model: 调用 LLM 时使用的模型名；具体含义由 ``llm_factory`` 返回的客户端决定。
+        page_title_llm_max_chars: 仅 ``page_per_page`` 布局下，某页无 ``#``/``##`` 时由 LLM
+            生成页标题的最大字符数（超出则截断）。
     """
 
     doc_id: str | None = None
@@ -39,6 +41,7 @@ class PageIndexOptions:
     if_add_summary: bool = True
     summary_char_threshold: int = 600
     model: str | None = None
+    page_title_llm_max_chars: int = 50
 
 
 def compute_line_count(content: str) -> int:
@@ -314,11 +317,138 @@ def build_forest_from_markdown(lines: list[str], page_by_line: list[int]) -> lis
     return forest
 
 
+#: 构建树时的布局模式，用作 ``layout`` 参数取值：``h1_forest`` | ``page_per_page``。
+PageIndexLayout = Literal["h1_forest", "page_per_page"]
+
+
+def group_line_ranges_by_page(page_by_line: list[int]) -> list[tuple[int, int, int]]:
+    """将 ``parse_page_comments`` 结果合并为连续行区间。
+
+    入参:
+        page_by_line: 与全文行等长的页码列表，通常来自 ``parse_page_comments(lines)``。
+
+    返回:
+        ``(page_num, start, end)`` 元组列表；``start``/``end`` 为 0 起始、闭区间行下标。
+    """
+    if not page_by_line:
+        return []
+    out: list[tuple[int, int, int]] = []
+    start = 0
+    p = page_by_line[0]
+    for i in range(1, len(page_by_line)):
+        if page_by_line[i] != p:
+            out.append((p, start, i - 1))
+            start = i
+            p = page_by_line[i]
+    out.append((p, start, len(page_by_line) - 1))
+    return out
+
+
+def _page_node_title(
+    lines: list[str],
+    start: int,
+    end: int,
+    page_num: int,
+    all_headers: list[dict[str, Any]],
+) -> tuple[str, bool]:
+    """计算「每页一节点」布局下该页的展示标题（内部）。
+
+    入参:
+        lines: 全文行列表（当前仅用于签名一致性，标题由 ``all_headers`` 与区间决定）。
+        start: 该页起始行下标（含）。
+        end: 该页结束行下标（含）。
+        page_num: 逻辑页码 ``N``（用于占位及启发式回退）。
+        all_headers: ``iter_atx_headers(lines)`` 的返回值。
+
+    返回:
+        ``(title, needs_llm_title)``：页内首个 ``#`` 或首个 ``##`` 的规范化标题时第二项为
+        False；二者皆无时第一项为临时占位 ``第 {page_num} 页``，第二项为 True（后续由
+        LLM 或启发式替换为短标题，见设计文档 §3.1.E）。
+    """
+    h1 = next(
+        (h for h in all_headers if h["level"] == 1 and start <= h["line_idx"] <= end),
+        None,
+    )
+    if h1:
+        return (normalize_display_title(h1["raw_title"], 1), False)
+    h2 = next(
+        (h for h in all_headers if h["level"] == 2 and start <= h["line_idx"] <= end),
+        None,
+    )
+    if h2:
+        return (normalize_display_title(h2["raw_title"], 2), False)
+    return (f"第 {page_num} 页", True)
+
+
+def build_forest_page_per_page_with_doc_root(
+    lines: list[str], page_by_line: list[int]
+) -> list[dict[str, Any]]:
+    """页驱动布局：单文档根 + 每页一个子节点（整页 ``text``，子节点 ``nodes`` 为空列表）。
+
+    文档根与全篇第一个 H1 段的根规则一致（``build_section_root_and_flat_nodes``）；
+    详见 ``docs/design/design_md_pageindex.md`` §3.1。
+
+    入参:
+        lines: 全文行列表。
+        page_by_line: 与 ``lines`` 等长的页码列表，来自 ``parse_page_comments(lines)``。
+
+    返回:
+        长度为 1 的森林列表，元素为文档根字典（含 ``_line_idx``、``title``、``page_index``、
+        ``text``、``nodes``）；``nodes`` 为按页顺序的页节点列表。
+
+    异常:
+        ValueError: ``lines`` 与 ``page_by_line`` 长度不一致时抛出。
+    """
+    if len(lines) != len(page_by_line):
+        raise ValueError("lines and page_by_line must have the same length.")
+    all_h = iter_atx_headers(lines)
+    h1s = find_h1_line_indices(all_h)
+
+    if h1s:
+        h1_line = h1s[0]
+        section_end = (h1s[1] - 1) if len(h1s) > 1 else (len(lines) - 1)
+        root, _flat = build_section_root_and_flat_nodes(
+            lines, page_by_line, all_h, h1_line, section_end
+        )
+        doc_root: dict[str, Any] = {
+            "_line_idx": root["_line_idx"],
+            "title": root["title"],
+            "page_index": root["page_index"],
+            "text": root["text"],
+            "nodes": [],
+        }
+    else:
+        doc_root = {
+            "_line_idx": 0,
+            "title": "Document",
+            "page_index": page_by_line[0] if page_by_line else 1,
+            "text": "",
+            "nodes": [],
+        }
+
+    page_children: list[dict[str, Any]] = []
+    for page_num, start, end in group_line_ranges_by_page(page_by_line):
+        title, needs_llm_title = _page_node_title(lines, start, end, page_num, all_h)
+        node: dict[str, Any] = {
+            "_line_idx": start,
+            "title": title,
+            "page_index": page_num,
+            "text": _join_lines(lines, start, end),
+            "nodes": [],
+        }
+        if needs_llm_title:
+            node["_needs_llm_page_title"] = True
+        page_children.append(node)
+    doc_root["nodes"] = page_children
+    return [doc_root]
+
+
 def assign_node_ids_preorder(forest: list[dict[str, Any]]) -> None:
     """对整片森林做深度优先先序遍历，依次为节点写入 ``node_id``（``0000``、``0001``、…）。
 
     入参:
-        forest: ``build_forest_from_markdown`` 等返回的树列表；原地修改各节点。
+        forest: 内存中的树森林，例如 ``build_forest_from_markdown`` 或
+        ``build_forest_page_per_page_with_doc_root`` 的返回值；**原地**修改各节点。
 
     返回:
         无（``None``）。
@@ -326,7 +456,14 @@ def assign_node_ids_preorder(forest: list[dict[str, Any]]) -> None:
     counter = 0
 
     def visit(n: dict[str, Any]) -> None:
-        """单节点递归访问，分配递增 id。"""
+        """递归访问单节点并分配递增 ``node_id``。
+
+        入参:
+            n: 当前树节点；原地写入 ``node_id``。
+
+        返回:
+            无。
+        """
         nonlocal counter
         n["node_id"] = str(counter).zfill(4)
         counter += 1
@@ -372,17 +509,36 @@ def strip_forest(forest: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [strip_internal_fields(t) for t in forest]
 
 
-def _heuristic_doc_summary(forest: list[dict[str, Any]], line_count: int) -> str:
-    """无 LLM 时，用行数与各根标题拼一段简短文档摘要。
+def _doc_summary_title_list(forest: list[dict[str, Any]]) -> list[str]:
+    """组装文档级摘要（启发式或 LLM）所用的章节标题列表（内部）。
 
     入参:
-        forest: 内存中的树森林（取每棵根的 ``title``）。
-        line_count: 全文行数。
+        forest: 内存树森林；若仅含一棵根且其 ``nodes`` 非空，则拼接根标题与至多 25 个子节点
+        标题，否则只取各树根的 ``title``。
 
     返回:
-        一段中文说明性字符串。
+        非空的标题字符串列表，供 ``_heuristic_doc_summary`` / ``generate_doc_summary`` 使用。
     """
-    titles = [t["title"] for t in forest]
+    if len(forest) == 1:
+        root = forest[0]
+        kids = root.get("nodes") or []
+        if kids:
+            return [root["title"]] + [k["title"] for k in kids[:25]]
+        return [root["title"]]
+    return [t["title"] for t in forest]
+
+
+def _heuristic_doc_summary(forest: list[dict[str, Any]], line_count: int) -> str:
+    """无 LLM 时，用行数与 ``_doc_summary_title_list`` 拼一段简短文档摘要。
+
+    入参:
+        forest: 内存中的树森林。
+        line_count: 全文行数，写入摘要句首。
+
+    返回:
+        一段中文说明性字符串（标题至多取前 12 条，超出加「等」）。
+    """
+    titles = _doc_summary_title_list(forest)
     return (
         f"本文档共 {line_count} 行，包含以下主要部分："
         + "、".join(titles[:12])
@@ -414,7 +570,7 @@ async def generate_doc_summary(
     """
     if not use_llm or llm is None:
         return _heuristic_doc_summary(forest, line_count)
-    titles = [t["title"] for t in forest]
+    titles = _doc_summary_title_list(forest)
     prompt = (
         "请用 2～4 句中文概括以下报告的目的、主要章节要点和结论导向。"
         "不要编造数据，仅根据给出的目录与摘录推断。\n\n"
@@ -441,6 +597,119 @@ def _heuristic_node_summary(title: str, text: str, max_len: int = 320) -> str:
     return (body[: max_len - 1] + "…").strip()
 
 
+def _collect_nodes_needing_llm_page_title(forest: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """收集仍带 ``_needs_llm_page_title`` 标记的树节点（内部）。
+
+    入参:
+        forest: 内存树森林。
+
+    返回:
+        需补全页标题的节点列表（通常为 ``page_per_page`` 下无 ``#``/``##`` 的页节点）。
+    """
+    out: list[dict[str, Any]] = []
+
+    def walk(n: dict[str, Any]) -> None:
+        if n.get("_needs_llm_page_title"):
+            out.append(n)
+        for c in n.get("nodes") or []:
+            walk(c)
+
+    for r in forest:
+        walk(r)
+    return out
+
+
+def _heuristic_short_page_title(text: str, page_num: int, max_len: int) -> str:
+    """无 LLM 时，将页正文压成不超过 ``max_len`` 字的短标题。
+
+    入参:
+        text: 该页 ``text``。
+        page_num: 逻辑页码；正文为空时写入 ``第 {page_num} 页``。
+        max_len: 最大字符数。
+
+    返回:
+        非空标题字符串。
+    """
+    body = text.replace("\n", " ").strip()
+    if not body:
+        return f"第 {page_num} 页"
+    if len(body) <= max_len:
+        return body
+    return (body[: max_len - 1] + "…").strip()
+
+
+def _sanitize_llm_page_title_line(raw: str, max_len: int) -> str:
+    """取模型输出首行并截断到 ``max_len``，去掉常见前缀与首尾引号。
+
+    入参:
+        raw: 模型原始输出。
+        max_len: 标题最大长度。
+
+    返回:
+        清理后的标题；无效时为空串。
+    """
+    s = raw.split("\n")[0].strip().strip('"').strip("'")
+    for prefix in ("标题：", "标题:", "Title:", "输出：", "输出:"):
+        if s.startswith(prefix):
+            s = s[len(prefix) :].strip()
+    if not s:
+        return ""
+    if len(s) > max_len:
+        return s[:max_len].rstrip() + "…"
+    return s
+
+
+async def generate_llm_page_titles_when_no_heading(
+    forest: list[dict[str, Any]],
+    *,
+    model: str | None,
+    llm: Any | None,
+    use_llm: bool,
+    max_title_chars: int,
+) -> None:
+    """为无 ``#``/``##`` 的页节点写入最终 ``title``（LLM 一句概括或启发式）。
+
+    原地修改 ``forest`` 中带 ``_needs_llm_page_title`` 的节点，并移除该标记。
+
+    入参:
+        forest: 内存树森林。
+        model: LLM 模型名。
+        llm: 异步客户端；``use_llm`` 为 True 且非空时调用 ``acompletion``。
+        use_llm: 是否调用模型。
+        max_title_chars: 标题最大字符数（提示与截断一致）。
+
+    返回:
+        无（``None``）。
+    """
+    nodes = _collect_nodes_needing_llm_page_title(forest)
+    if not nodes:
+        return
+
+    async def one(n: dict[str, Any]) -> None:
+        text = (n.get("text") or "").strip()
+        page_num = int(n.get("page_index") or 0)
+        if not use_llm or llm is None:
+            n["title"] = _heuristic_short_page_title(text, page_num, max_title_chars)
+            n.pop("_needs_llm_page_title", None)
+            return
+        prompt = (
+            f"请根据下面书页/幻灯的正文，生成一个简短中文标题，不得超过{max_title_chars}个字符。"
+            "只输出标题本身，不要引号、书名号、序号或任何解释。\n\n"
+            f"正文：\n{text[:12000]}"
+        )
+        try:
+            raw = (await llm.acompletion(model=model, prompt=prompt)).strip()
+        except Exception:
+            raw = ""
+        title = _sanitize_llm_page_title_line(raw, max_title_chars)
+        if not title:
+            title = _heuristic_short_page_title(text, page_num, max_title_chars)
+        n["title"] = title
+        n.pop("_needs_llm_page_title", None)
+
+    await asyncio.gather(*[one(n) for n in nodes])
+
+
 async def generate_node_summaries(
     forest: list[dict[str, Any]],
     *,
@@ -464,7 +733,14 @@ async def generate_node_summaries(
     nodes_flat: list[dict[str, Any]] = []
 
     def collect(n: dict[str, Any]) -> None:
-        """先序收集所有节点到扁平列表。"""
+        """先序遍历，将节点及其子孙加入 ``nodes_flat``。
+
+        入参:
+            n: 树节点。
+
+        返回:
+            无。
+        """
         nodes_flat.append(n)
         for c in n.get("nodes") or []:
             collect(c)
@@ -473,7 +749,14 @@ async def generate_node_summaries(
         collect(r)
 
     async def one(n: dict[str, Any]) -> None:
-        """为单个节点生成 ``summary``。"""
+        """为单个节点生成 ``summary``（短正文直拷贝，长正文启发式或 LLM）。
+
+        入参:
+            n: 树节点；原地写入 ``summary``。
+
+        返回:
+            无。
+        """
         text = n.get("text") or ""
         title = n.get("title") or ""
         if len(text) < char_threshold:
@@ -495,6 +778,8 @@ async def build_pageindex_payload(
     md_path: str | Path,
     opt: PageIndexOptions | None = None,
     llm_factory: Callable[[], Any] | None = None,
+    *,
+    layout: PageIndexLayout = "h1_forest",
 ) -> dict[str, Any]:
     """从 Markdown 文件路径构建完整 API 载荷（含 ``doc_id``、``line_count``、``summary``、``result``）。
 
@@ -502,6 +787,7 @@ async def build_pageindex_payload(
         md_path: ``combined_document.md`` 等文件路径。
         opt: 选项；默认 ``PageIndexOptions()``。
         llm_factory: 无参可调用，返回 LLM 客户端；为 None 或创建失败时摘要走启发式/空串。
+        layout: ``h1_forest`` 按一级标题分段；``page_per_page`` 为文档根 + 每页一节点（§3.1）。
 
     返回:
         可 ``json.dumps`` 的字典，键含 ``doc_id``、``status``、``retrieval_ready``、
@@ -514,24 +800,36 @@ async def build_pageindex_payload(
     line_count = compute_line_count(content)
     page_by_line = parse_page_comments(lines)
 
-    forest = build_forest_from_markdown(lines, page_by_line)
+    forest = _build_forest_for_layout(lines, page_by_line, layout)
     assign_node_ids_preorder(forest)
 
+    needs_llm_page_title = bool(_collect_nodes_needing_llm_page_title(forest))
     llm = None
-    use_llm = opt.if_add_summary and llm_factory is not None
-    if use_llm:
+    want_llm = (opt.if_add_summary or needs_llm_page_title) and llm_factory is not None
+    if want_llm:
         try:
             llm = llm_factory()
         except Exception:
             llm = None
-            use_llm = False
+
+    use_llm_summaries = opt.if_add_summary and llm is not None
+    use_llm_page_titles = needs_llm_page_title and llm is not None
+
+    if needs_llm_page_title:
+        await generate_llm_page_titles_when_no_heading(
+            forest,
+            model=opt.model,
+            llm=llm,
+            use_llm=use_llm_page_titles,
+            max_title_chars=opt.page_title_llm_max_chars,
+        )
 
     if opt.if_add_summary:
         await generate_node_summaries(
             forest,
             model=opt.model,
             llm=llm,
-            use_llm=use_llm,
+            use_llm=use_llm_summaries,
             char_threshold=opt.summary_char_threshold,
         )
         doc_summary = await generate_doc_summary(
@@ -540,7 +838,7 @@ async def build_pageindex_payload(
             line_count,
             model=opt.model,
             llm=llm,
-            use_llm=use_llm,
+            use_llm=use_llm_summaries,
         )
     else:
         for r in forest:
@@ -562,6 +860,30 @@ async def build_pageindex_payload(
     }
 
 
+def _build_forest_for_layout(
+    lines: list[str],
+    page_by_line: list[int],
+    layout: PageIndexLayout,
+) -> list[dict[str, Any]]:
+    """按布局枚举选择建树实现（内部）。
+
+    入参:
+        lines: 全文行列表。
+        page_by_line: ``parse_page_comments(lines)`` 的返回值。
+        layout: ``h1_forest`` 或 ``page_per_page``。
+
+    返回:
+        未分配 ``node_id`` 的树森林。
+
+    异常:
+        ValueError: 当 ``layout`` 为 ``h1_forest`` 且文中无 H1 时，由
+        ``build_forest_from_markdown`` 抛出。
+    """
+    if layout == "page_per_page":
+        return build_forest_page_per_page_with_doc_root(lines, page_by_line)
+    return build_forest_from_markdown(lines, page_by_line)
+
+
 def _clear_summaries(n: dict[str, Any]) -> None:
     """递归将节点 ``summary`` 置为空串（关闭摘要生成时使用）。
 
@@ -580,6 +902,8 @@ def sync_build_pageindex_payload(
     md_path: str | Path,
     opt: PageIndexOptions | None = None,
     llm_factory: Callable[[], Any] | None = None,
+    *,
+    layout: PageIndexLayout = "h1_forest",
 ) -> dict[str, Any]:
     """``build_pageindex_payload`` 的同步包装，在内部 ``asyncio.run`` 一次。
 
@@ -587,15 +911,136 @@ def sync_build_pageindex_payload(
         md_path: Markdown 文件路径。
         opt: 构建选项。
         llm_factory: LLM 工厂，语义同 ``build_pageindex_payload``。
+        layout: 布局，语义同 ``build_pageindex_payload``。
 
     返回:
         与 ``build_pageindex_payload`` 相同的字典。
     """
-    return asyncio.run(build_pageindex_payload(md_path, opt, llm_factory))
+    return asyncio.run(build_pageindex_payload(md_path, opt, llm_factory, layout=layout))
+
+
+async def build_pageindex_payload_from_lines(
+    lines: list[str],
+    opt: PageIndexOptions | None = None,
+    llm_factory: Callable[[], Any] | None = None,
+    *,
+    doc_id_seed: str | None = None,
+    layout: PageIndexLayout = "h1_forest",
+) -> dict[str, Any]:
+    """从行列表构建完整 PageIndex API 载荷（无文件路径，便于管道内调用）。
+
+    入参:
+        lines: 已按换行切分后的行列表（每行不含换行符）。
+        opt: 选项；默认 ``PageIndexOptions()``。
+        llm_factory: 无参可调用，返回 LLM 客户端；为 None 或创建失败时摘要走启发式。
+        doc_id_seed: 当 ``opt.doc_id`` 为 None 时，参与 UUID5 的种子（默认取内容前 8000 字符）。
+        layout: ``h1_forest`` 或 ``page_per_page``。
+
+    返回:
+        与 ``build_pageindex_payload`` 相同结构的字典。
+
+    异常:
+        ValueError: 当 ``layout`` 为 ``h1_forest`` 且文中无 H1 时可能抛出。
+    """
+    opt = opt or PageIndexOptions()
+    content = "\n".join(lines)
+    if not content.endswith("\n"):
+        content += "\n"
+    line_count = compute_line_count(content)
+    page_by_line = parse_page_comments(lines)
+    forest = _build_forest_for_layout(lines, page_by_line, layout)
+    assign_node_ids_preorder(forest)
+
+    needs_llm_page_title = bool(_collect_nodes_needing_llm_page_title(forest))
+    llm = None
+    want_llm = (opt.if_add_summary or needs_llm_page_title) and llm_factory is not None
+    if want_llm:
+        try:
+            llm = llm_factory()
+        except Exception:
+            llm = None
+
+    use_llm_summaries = opt.if_add_summary and llm is not None
+    use_llm_page_titles = needs_llm_page_title and llm is not None
+
+    if needs_llm_page_title:
+        await generate_llm_page_titles_when_no_heading(
+            forest,
+            model=opt.model,
+            llm=llm,
+            use_llm=use_llm_page_titles,
+            max_title_chars=opt.page_title_llm_max_chars,
+        )
+
+    if opt.if_add_summary:
+        await generate_node_summaries(
+            forest,
+            model=opt.model,
+            llm=llm,
+            use_llm=use_llm_summaries,
+            char_threshold=opt.summary_char_threshold,
+        )
+        doc_summary = await generate_doc_summary(
+            forest,
+            content,
+            line_count,
+            model=opt.model,
+            llm=llm,
+            use_llm=use_llm_summaries,
+        )
+    else:
+        for r in forest:
+            _clear_summaries(r)
+        doc_summary = ""
+
+    doc_id = opt.doc_id
+    if not doc_id:
+        seed = doc_id_seed or content[:8000]
+        doc_id = str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
+
+    result_trees = strip_forest(forest)
+    return {
+        "doc_id": doc_id,
+        "status": opt.status,
+        "retrieval_ready": opt.retrieval_ready,
+        "line_count": line_count,
+        "summary": doc_summary,
+        "result": result_trees,
+    }
+
+
+def sync_build_pageindex_payload_from_lines(
+    lines: list[str],
+    opt: PageIndexOptions | None = None,
+    llm_factory: Callable[[], Any] | None = None,
+    *,
+    doc_id_seed: str | None = None,
+    layout: PageIndexLayout = "h1_forest",
+) -> dict[str, Any]:
+    """``build_pageindex_payload_from_lines`` 的同步包装（内部 ``asyncio.run`` 一次）。
+
+    入参:
+        lines: 全文行列表。
+        opt: 构建选项。
+        llm_factory: LLM 工厂。
+        doc_id_seed: 确定性 ``doc_id`` 种子。
+        layout: 布局，语义同 ``build_pageindex_payload_from_lines``。
+
+    返回:
+        与 ``build_pageindex_payload_from_lines`` 相同的字典。
+    """
+    return asyncio.run(
+        build_pageindex_payload_from_lines(
+            lines, opt, llm_factory, doc_id_seed=doc_id_seed, layout=layout
+        )
+    )
 
 
 def main_argv(argv: list[str] | None = None) -> None:
     """命令行入口：解析参数，生成 JSON 并写入默认或指定的输出路径。
+
+    使用 ``--input-md`` 指定 Markdown（默认可省略，见参数帮助），``--layout`` 选择 ``h1_forest`` 或
+    ``page_per_page``（带 ``<!-- page:N -->`` 的 MinerU 类稿件用后者，见 design_md_pageindex §3.1）。
 
     入参:
         argv: 参数列表；为 None 时使用 ``sys.argv``。
@@ -603,22 +1048,62 @@ def main_argv(argv: list[str] | None = None) -> None:
     返回:
         无；成功时打印写出路径。
     """
-    parser = argparse.ArgumentParser(description="Build PageIndex JSON from combined_document.md")
-    parser.add_argument("--md", dest="md_path", type=str, default=None)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build PageIndex JSON from Markdown: --input-md (default combined) + --layout "
+            "(h1-forest or page-per-page for paged <!-- page:N --> input)."
+        )
+    )
+    parser.add_argument(
+        "--input-md",
+        dest="input_md_path",
+        type=str,
+        default=None,
+        help="输入 Markdown 路径；未指定时用仓库内 docs/.../combined_document.md",
+    )
     parser.add_argument("--out", dest="out_path", type=str, default=None)
     parser.add_argument("--doc-id", type=str, default=None)
     parser.add_argument("--if-add-summary", type=str, default="yes", choices=("yes", "no"))
     parser.add_argument("--summary-threshold", type=int, default=600)
+    parser.add_argument(
+        "--page-title-max-chars",
+        type=int,
+        default=50,
+        help="page-per-page 下某页无 #/## 时，LLM/启发式页标题最大字符数（默认 50）",
+    )
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--retrieval-ready", type=str, default="no", choices=("yes", "no"))
+    parser.add_argument(
+        "--layout",
+        type=str,
+        default="h1-forest",
+        choices=("h1-forest", "page-per-page"),
+        help="h1-forest：按一级标题分段；page-per-page：文档根 + 每逻辑页一节点（含 MinerU 导出稿）",
+    )
     args = parser.parse_args(argv)
 
     base = Path(__file__).resolve().parent
-    md_path = Path(args.md_path) if args.md_path else base / "docs/results_with_vlm/game2025report_v7/combined_document.md"
-    out_path = Path(args.out_path) if args.out_path else base / "docs/results_with_vlm/game2025report_v7/out_generated.json"
+    md_path = (
+        Path(args.input_md_path)
+        if args.input_md_path
+        else base / "docs/results_with_vlm/game2025report_v7/combined_document.md"
+    )
+    layout_kw: PageIndexLayout = "page_per_page" if args.layout == "page-per-page" else "h1_forest"
+    out_path = (
+        Path(args.out_path)
+        if args.out_path
+        else base / "docs/results_with_vlm/game2025report_v7/out_generated.json"
+    )
 
     def llm_factory() -> Any:
-        """构造本工程使用的 Qwen/DashScope 兼容客户端。"""
+        """构造本工程使用的 Qwen/DashScope 兼容异步客户端。
+
+        入参:
+            无。
+
+        返回:
+            具备 ``acompletion(model, prompt) -> str`` 的客户端实例。
+        """
         from llm import QwenChatClient
 
         return QwenChatClient()
@@ -629,9 +1114,10 @@ def main_argv(argv: list[str] | None = None) -> None:
         if_add_summary=args.if_add_summary.lower() == "yes",
         summary_char_threshold=args.summary_threshold,
         model=args.model,
+        page_title_llm_max_chars=args.page_title_max_chars,
     )
 
-    payload = sync_build_pageindex_payload(md_path, opt, llm_factory=llm_factory)
+    payload = sync_build_pageindex_payload(md_path, opt, llm_factory=llm_factory, layout=layout_kw)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Wrote {out_path}")
