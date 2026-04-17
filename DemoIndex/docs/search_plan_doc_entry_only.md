@@ -93,6 +93,11 @@ Implementation note:
 - Stage 1 should stay generic in core code
 - domain-specific fields such as metrics, region, platform, and genre should only come from an optional external retrieval profile or a fallback LLM parse for sparse queries
 - already-informative Chinese queries should usually skip query-time LLM enrichment
+- current implementation exposes Stage 1 tuning through:
+  - `use_llm_parse`
+  - `parse_model`
+  - `parse_fallback_model`
+  - `retrieval_profile_path`
 
 ### Stage 2: Global Candidate Recall
 
@@ -106,6 +111,10 @@ Implementation note:
 - lexical recall should remain PostgreSQL-based
 - Chinese-heavy queries should rely on derived search terms plus weighted title/title-path/body matching
 - `pg_trgm` should be used as a ranking aid, not as a strict whole-query filter
+- current implementation exposes Stage 2 tuning through:
+  - all recall limits such as `top_k_dense`, `top_k_lexical`, `top_k_fused_chunks`, `top_k_docs`
+  - aggregation limits such as `top_k_sections_per_doc`, `top_k_chunks_per_section`, `doc_score_chunk_limit`, `section_score_chunk_limit`
+  - retrieval scoring knobs such as `embedding_model`, `rrf_k`, and `lexical_score_threshold`
 
 The goal is only to find relevant documents, not relevant sections.
 
@@ -127,6 +136,11 @@ Then choose top-N documents.
 No section anchor is retained as a required entry point.
 
 Section-level information can still be logged for debugging, but it is not used as the formal tree-entry prior.
+
+Current implementation note:
+
+- this remains the documented fallback strategy
+- current code still keeps section-level Stage 2 output available, so switching between doc-entry-only and anchor-first is mostly an orchestration choice
 
 ### Stage 4: Whole-Tree Search
 

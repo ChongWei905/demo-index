@@ -98,6 +98,11 @@ Implementation note:
 - Stage 1 should stay generic in core code
 - domain-specific fields such as metrics, region, platform, and genre should only be filled by an optional external retrieval profile or by one fallback LLM parse when the query is genuinely sparse
 - already-informative Chinese queries should usually skip query-time LLM enrichment
+- current implementation exposes Stage 1 tuning through:
+  - `use_llm_parse`
+  - `parse_model`
+  - `parse_fallback_model`
+  - `retrieval_profile_path`
 
 ### Stage 2: Global Candidate Recall
 
@@ -111,6 +116,10 @@ Implementation note:
 - lexical recall should stay PostgreSQL-native
 - Chinese-heavy queries should use generic derived search terms plus weighted title/title-path/body hits
 - `pg_trgm` should be used as a soft scoring signal, not as a strict whole-query gate
+- current implementation exposes Stage 2 tuning through:
+  - all recall limits such as `top_k_dense`, `top_k_lexical`, `top_k_fused_chunks`, `top_k_docs`
+  - aggregation limits such as `top_k_sections_per_doc`, `top_k_chunks_per_section`, `doc_score_chunk_limit`, `section_score_chunk_limit`
+  - retrieval scoring knobs such as `embedding_model`, `rrf_k`, and `lexical_score_threshold`
 
 The goal of this stage is not to answer directly.
 It is only to find:
@@ -139,6 +148,11 @@ This is the key difference from public PageIndex examples.
 PageIndex clearly exposes `chunk -> doc` and `chunk -> node` scoring, but it does not publicly describe a `section-anchor-first` document entry policy.
 DemoIndex adds that policy on purpose.
 
+Current implementation note:
+
+- anchor count is configurable with `top_k_anchor_sections_per_doc`
+- doc count is configurable with `top_k_docs`
+
 ### Stage 4: Subtree-First Tree Search
 
 For each selected document:
@@ -156,6 +170,21 @@ The tree search unit remains the section node, not the chunk.
 
 This stage still follows the PageIndex principle that the final retrieval unit is the tree node or section.
 Chunks are only the evidence used to score and localize nodes.
+
+Current implementation note:
+
+- Stage 3 localization already supports:
+  - `heuristic`
+  - `hybrid`
+- `hybrid` uses a heuristic shortlist plus one per-doc rerank call
+- the current implementation exposes:
+  - `stage3_mode`
+  - `top_k_tree_sections_per_doc`
+  - `whole_doc_fallback`
+  - `rerank_model`
+  - `rerank_fallback_model`
+  - `stage3_shortlist_size`
+  - `stage3_relation_priors`
 
 ### Stage 5: Evidence Aggregation
 

@@ -1,4 +1,4 @@
-"""Unit tests for DemoIndex Stage 1 + Stage 2 retrieval logic."""
+"""Unit tests for DemoIndex retrieval logic."""
 
 from __future__ import annotations
 
@@ -9,17 +9,26 @@ import unittest
 from unittest.mock import patch
 
 from DemoIndex.retrieval import (
+    DocCandidate,
+    LocalizedSection,
     QueryUnderstanding,
+    RetrievalStage12Result,
     RetrievalChunkHit,
+    SectionCandidate,
+    _Stage3TreeSection,
     _aggregate_candidates,
+    _build_stage3_candidate_pool,
     _derive_search_terms,
     _fuse_chunk_hits,
+    _rerank_stage3_sections_with_llm,
+    _score_stage3_candidates,
+    localize_sections,
     parse_query,
 )
 
 
 class RetrievalUnitTests(unittest.TestCase):
-    """Cover rule parsing, LLM fallback, fusion, and aggregation helpers."""
+    """Cover parsing, fusion, aggregation, and Stage 3 helpers."""
 
     def test_parse_query_rule_based_mixed_language(self) -> None:
         """Generic parsing should extract language, intent, terms, and time scope."""
@@ -129,7 +138,12 @@ class RetrievalUnitTests(unittest.TestCase):
                 "lexical_score": 0.55,
             },
         ]
-        fused = _fuse_chunk_hits(dense_hits=dense_hits, lexical_hits=lexical_hits, top_k_fused_chunks=10)
+        fused = _fuse_chunk_hits(
+            dense_hits=dense_hits,
+            lexical_hits=lexical_hits,
+            top_k_fused_chunks=10,
+            rrf_k=60,
+        )
         self.assertEqual(fused[0].chunk_id, "c1")
         self.assertIsNotNone(fused[0].dense_rank)
         self.assertIsNotNone(fused[0].lexical_rank)
@@ -177,12 +191,224 @@ class RetrievalUnitTests(unittest.TestCase):
                 top_k_docs=1,
                 top_k_sections_per_doc=1,
                 top_k_chunks_per_section=1,
+                doc_score_chunk_limit=5,
+                section_score_chunk_limit=3,
             )
         self.assertEqual(len(docs), 1)
         self.assertEqual(docs[0].doc_id, "d1")
         self.assertEqual(len(docs[0].section_candidates), 1)
         self.assertEqual(len(docs[0].section_candidates[0].supporting_chunks), 1)
         self.assertEqual(len(sections), 1)
+
+    def test_stage3_candidate_pool_expands_anchor_relations(self) -> None:
+        """Stage 3 candidate-pool expansion should include tree relations around anchors."""
+        doc_sections = {
+            "root": _Stage3TreeSection("root", None, "d1", "n0", "Root", 0, "root summary", "Root"),
+            "s1": _Stage3TreeSection("s1", "root", "d1", "n1", "Anchor", 1, "anchor summary", "Root > Anchor"),
+            "s2": _Stage3TreeSection("s2", "s1", "d1", "n2", "Child", 2, "child summary", "Root > Anchor > Child"),
+            "s3": _Stage3TreeSection("s3", "root", "d1", "n3", "Sibling", 1, "sibling summary", "Root > Sibling"),
+        }
+        children_map = {
+            None: ["root"],
+            "root": ["s1", "s3"],
+            "s1": ["s2"],
+        }
+        anchor_sections = [
+            SectionCandidate(
+                doc_id="d1",
+                section_id="s1",
+                node_id="n1",
+                title="Anchor",
+                depth=1,
+                summary="anchor summary",
+                section_score=0.03,
+                matched_chunk_count=1,
+                supporting_chunks=[{"chunk_id": "c1"}],
+            )
+        ]
+        stage2_lookup = {("d1", "s1"): anchor_sections[0]}
+        candidate_pool, used_whole_doc_fallback = _build_stage3_candidate_pool(
+            doc_id="d1",
+            doc_sections=doc_sections,
+            children_map=children_map,
+            anchor_sections=anchor_sections,
+            stage2_section_lookup=stage2_lookup,
+            top_k_tree_sections_per_doc=5,
+            whole_doc_fallback=False,
+        )
+        self.assertFalse(used_whole_doc_fallback)
+        self.assertEqual(candidate_pool["s1"]["relation_to_anchor"], "anchor")
+        self.assertEqual(candidate_pool["s2"]["relation_to_anchor"], "descendant")
+        self.assertEqual(candidate_pool["root"]["relation_to_anchor"], "ancestor")
+        self.assertEqual(candidate_pool["s3"]["relation_to_anchor"], "sibling")
+
+    def test_stage3_heuristic_prefers_anchor_over_doc_fallback(self) -> None:
+        """Heuristic localization should keep strong anchor matches above fallback nodes."""
+        understanding = QueryUnderstanding(
+            raw_query="2024 CPI 趋势",
+            normalized_query="2024 CPI 趋势",
+            language="mixed",
+            intent="trend",
+            terms=["2024", "CPI"],
+            metrics=[],
+            regions=[],
+            platforms=[],
+            genres=[],
+            time_scope={"years": [2024], "quarters": [], "raw_mentions": ["2024"]},
+            llm_enriched=False,
+        )
+        candidate_pool = {
+            "anchor": {
+                "section": _Stage3TreeSection("anchor", None, "d1", "n1", "2024 CPI", 1, "CPI summary", "2024 CPI"),
+                "anchor_section_id": "anchor",
+                "relation_to_anchor": "anchor",
+                "reason_codes": ["relation:anchor"],
+                "stage2_section_score": 0.03,
+                "supporting_chunks": [{"chunk_id": "c1"}],
+            },
+            "fallback": {
+                "section": _Stage3TreeSection("fallback", None, "d1", "n2", "Overview", 1, "generic summary", "Overview"),
+                "anchor_section_id": None,
+                "relation_to_anchor": "doc_fallback",
+                "reason_codes": ["relation:doc_fallback"],
+                "stage2_section_score": 0.0,
+                "supporting_chunks": [],
+            },
+        }
+        localized = _score_stage3_candidates(
+            query_understanding=understanding,
+            search_terms=_derive_search_terms(understanding),
+            candidate_pool=candidate_pool,
+            top_k_tree_sections_per_doc=5,
+            stage3_relation_priors={
+                "anchor": 4.0,
+                "descendant": 2.75,
+                "ancestor": 2.1,
+                "sibling": 1.45,
+                "doc_fallback": 0.55,
+            },
+        )
+        self.assertEqual(localized[0].section_id, "anchor")
+        self.assertGreater(localized[0].localization_score, localized[1].localization_score)
+
+    def test_stage3_hybrid_rerank_accepts_valid_ids_and_ignores_invalid(self) -> None:
+        """Hybrid rerank should reorder valid shortlist ids and ignore invalid ids."""
+        shortlisted = [
+            LocalizedSection("d1", "s1", "n1", None, "A", 1, "summary a", "Root > A", 4.0, 0.03, "s1", "anchor", ["relation:anchor"], [{"chunk_id": "c1"}]),
+            LocalizedSection("d1", "s2", "n2", None, "B", 1, "summary b", "Root > B", 3.0, 0.0, "s1", "sibling", ["relation:sibling"], [{"chunk_id": "c1"}]),
+        ]
+
+        class _FakeChatClient:
+            def completion(self, _model: str, _prompt: str) -> str:
+                return json.dumps(
+                    {
+                        "ranked_sections": [
+                            {"section_id": "s2", "reason": "more direct"},
+                            {"section_id": "missing", "reason": "ignored"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+
+        reranked = _rerank_stage3_sections_with_llm(
+            query_understanding=QueryUnderstanding(
+                raw_query="query",
+                normalized_query="query",
+                language="en",
+                intent="general",
+                terms=["query"],
+                metrics=[],
+                regions=[],
+                platforms=[],
+                genres=[],
+                time_scope={"years": [], "quarters": [], "raw_mentions": []},
+                llm_enriched=False,
+            ),
+            anchor_sections=[],
+            shortlisted_sections=shortlisted,
+            top_k_tree_sections_per_doc=5,
+            llm_client=_FakeChatClient(),
+            rerank_model="dashscope/qwen3.6-plus",
+            debug_recorder=None,
+            doc_id="d1",
+        )
+        self.assertIsNotNone(reranked)
+        self.assertEqual(reranked[0].section_id, "s2")
+        self.assertIn("llm_rerank_selected", reranked[0].reason_codes)
+
+    def test_stage3_hybrid_falls_back_when_rerank_fails(self) -> None:
+        """Stage 3 should fall back to heuristic when hybrid rerank fails."""
+        stage12 = RetrievalStage12Result(
+            query_understanding=QueryUnderstanding(
+                raw_query="2024 CPI 趋势",
+                normalized_query="2024 CPI 趋势",
+                language="mixed",
+                intent="trend",
+                terms=["2024", "CPI"],
+                metrics=[],
+                regions=[],
+                platforms=[],
+                genres=[],
+                time_scope={"years": [2024], "quarters": [], "raw_mentions": ["2024"]},
+                llm_enriched=False,
+            ),
+            chunk_hits=[],
+            doc_candidates=[
+                DocCandidate(
+                    doc_id="d1",
+                    doc_score=0.1,
+                    matched_chunk_count=1,
+                    matched_section_count=1,
+                    top_section_ids=["s1"],
+                    section_candidates=[
+                        SectionCandidate(
+                            doc_id="d1",
+                            section_id="s1",
+                            node_id="n1",
+                            title="Anchor",
+                            depth=1,
+                            summary="anchor summary",
+                            section_score=0.03,
+                            matched_chunk_count=1,
+                            supporting_chunks=[{"chunk_id": "c1"}],
+                        )
+                    ],
+                )
+            ],
+            section_candidates=[
+                SectionCandidate(
+                    doc_id="d1",
+                    section_id="s1",
+                    node_id="n1",
+                    title="Anchor",
+                    depth=1,
+                    summary="anchor summary",
+                    section_score=0.03,
+                    matched_chunk_count=1,
+                    supporting_chunks=[{"chunk_id": "c1"}],
+                )
+            ],
+            metadata={"counts": {}, "settings": {}},
+        )
+        tree_sections = {
+            "d1": {
+                "root": _Stage3TreeSection("root", None, "d1", "n0", "Root", 0, "root summary", "Root"),
+                "s1": _Stage3TreeSection("s1", "root", "d1", "n1", "Anchor", 1, "anchor summary", "Root > Anchor"),
+            }
+        }
+        children_map = {"d1": {None: ["root"], "root": ["s1"]}}
+
+        with (
+            patch("DemoIndex.retrieval._load_tree_sections_for_docs", return_value=(tree_sections, children_map)),
+            patch("DemoIndex.retrieval.resolve_database_url", return_value="postgresql://unused"),
+            patch("DemoIndex.retrieval.load_dashscope_api_key"),
+            patch("DemoIndex.retrieval.QwenChatClient") as mock_client_cls,
+        ):
+            mock_client_cls.return_value.completion.side_effect = RuntimeError("boom")
+            result = localize_sections(stage12, mode="hybrid", top_k_tree_sections_per_doc=2)
+        self.assertTrue(result.localized_docs)
+        self.assertEqual(result.localized_docs[0].mode_used, "heuristic")
+        self.assertTrue(result.localized_sections)
 
 
 if __name__ == "__main__":

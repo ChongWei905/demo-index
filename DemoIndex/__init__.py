@@ -33,4 +33,25 @@ def retrieve_candidates(*args: Any, **kwargs: Any):
     return _retrieve_candidates(*args, **kwargs)
 
 
-__all__ = ["build_pageindex_tree", "compare_tree", "parse_query", "retrieve_candidates"]
+def localize_sections(*args: Any, **kwargs: Any):
+    """Run Stage 3 tree localization over an existing Stage 1 + 2 result."""
+    from .retrieval import localize_sections as _localize_sections
+
+    return _localize_sections(*args, **kwargs)
+
+
+def retrieve_tree_candidates(*args: Any, **kwargs: Any):
+    """Run Stage 1 + Stage 2 + Stage 3 retrieval and return tree-localized sections."""
+    from .retrieval import retrieve_tree_candidates as _retrieve_tree_candidates
+
+    return _retrieve_tree_candidates(*args, **kwargs)
+
+
+__all__ = [
+    "build_pageindex_tree",
+    "compare_tree",
+    "parse_query",
+    "retrieve_candidates",
+    "localize_sections",
+    "retrieve_tree_candidates",
+]

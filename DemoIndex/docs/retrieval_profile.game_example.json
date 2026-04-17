@@ -1,0 +1,59 @@
+{
+  "metrics": {
+    "CPI": ["cost per install", "单次安装成本", "每次安装成本", "获客成本"],
+    "ROAS": ["广告支出回报", "投放回报"],
+    "ARPU": ["每用户平均收入"],
+    "ARPMAU": ["每月活跃用户平均收入"],
+    "Retention": ["retention", "留存", "留存率", "次留", "d1", "d7", "d30"],
+    "IAA": ["广告变现", "in-app advertising"],
+    "IAP": ["内购", "应用内购买", "in-app purchase"],
+    "CTR": ["点击率"],
+    "CPM": ["千次展示成本"],
+    "LTV": ["用户生命周期价值"],
+    "DAU": ["日活", "日活跃用户"],
+    "MAU": ["月活", "月活跃用户"]
+  },
+  "regions": {
+    "Global": ["全球"],
+    "North America": ["北美"],
+    "Europe": ["欧洲"],
+    "LATAM": ["拉美", "拉丁美洲"],
+    "MENA": ["中东", "中东北非"],
+    "APAC": ["亚太"],
+    "China": ["中国"],
+    "United States": ["美国"],
+    "Japan": ["日本"],
+    "South Korea": ["韩国"],
+    "United Kingdom": ["英国"],
+    "Germany": ["德国"],
+    "France": ["法国"],
+    "India": ["印度"],
+    "Brazil": ["巴西"]
+  },
+  "platforms": {
+    "iOS": ["iphone", "ipad"],
+    "Android": ["安卓"],
+    "Mobile": ["mobile", "手游", "移动游戏"],
+    "PC": ["desktop", "端游"],
+    "Console": ["主机"],
+    "Steam": [],
+    "App Store": ["苹果商店"],
+    "Google Play": ["谷歌商店"]
+  },
+  "genres": {
+    "RPG": ["角色扮演"],
+    "Strategy": ["策略"],
+    "Action": ["动作"],
+    "Casual": ["休闲"],
+    "Hybrid Casual": ["混合休闲"],
+    "Hyper Casual": ["超休闲"],
+    "Casino": ["博彩"],
+    "Racing": ["竞速", "赛车"],
+    "Sports": ["体育"],
+    "Arcade": ["街机"],
+    "Puzzle": ["解谜"],
+    "Simulation": ["模拟"],
+    "Shooter": ["射击"],
+    "Card": ["卡牌"]
+  }
+}

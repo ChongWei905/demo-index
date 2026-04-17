@@ -1,4 +1,4 @@
-"""Stage 1 and Stage 2 retrieval helpers for DemoIndex."""
+"""Stage 1, Stage 2, and Stage 3 retrieval helpers for DemoIndex."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .debug import DebugRecorder
 from .env import REPO_ROOT, load_dashscope_api_key
@@ -82,6 +82,21 @@ LEADING_CJK_CONNECTOR_RE = re.compile(r"^[的和与及并就把将向对从在�
 TRAILING_CJK_CONNECTOR_RE = re.compile(r"(的|和|与|及|并|等|方面|情况)+$")
 PROFILE_FIELD_NAMES = ("metrics", "regions", "platforms", "genres")
 LEXICAL_SCORE_THRESHOLD = 0.18
+STAGE3_RELATION_PRIOR = {
+    "anchor": 4.0,
+    "descendant": 2.75,
+    "ancestor": 2.1,
+    "sibling": 1.45,
+    "doc_fallback": 0.55,
+}
+STAGE3_RELATION_ORDER = {
+    "anchor": 5,
+    "descendant": 4,
+    "ancestor": 3,
+    "sibling": 2,
+    "doc_fallback": 1,
+}
+DEFAULT_STAGE3_SHORTLIST_SIZE = 8
 
 
 @dataclass(frozen=True)
@@ -187,9 +202,157 @@ class RetrievalStage12Result:
         }
 
 
-def parse_query(query: str, *, use_llm: bool = True) -> QueryUnderstanding:
+@dataclass(frozen=True)
+class LocalizedSection:
+    """One Stage 3 tree-localized section candidate."""
+
+    doc_id: str
+    section_id: str
+    node_id: str
+    parent_id: str | None
+    title: str
+    depth: int
+    summary: str
+    title_path: str
+    localization_score: float
+    stage2_section_score: float
+    anchor_section_id: str | None
+    relation_to_anchor: Literal["anchor", "descendant", "ancestor", "sibling", "doc_fallback"]
+    reason_codes: list[str]
+    supporting_chunks: list[dict[str, Any]]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable representation."""
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class LocalizedDoc:
+    """One document-level Stage 3 localization result."""
+
+    doc_id: str
+    doc_score: float
+    mode_used: Literal["heuristic", "hybrid"]
+    anchor_sections: list[SectionCandidate] = field(default_factory=list)
+    localized_sections: list[LocalizedSection] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable representation."""
+        return {
+            "doc_id": self.doc_id,
+            "doc_score": self.doc_score,
+            "mode_used": self.mode_used,
+            "anchor_sections": [section.to_dict() for section in self.anchor_sections],
+            "localized_sections": [section.to_dict() for section in self.localized_sections],
+        }
+
+
+@dataclass(frozen=True)
+class RetrievalStage3Result:
+    """Rich Stage 1 + Stage 2 + Stage 3 retrieval handoff object."""
+
+    query_understanding: QueryUnderstanding
+    chunk_hits: list[RetrievalChunkHit]
+    doc_candidates: list[DocCandidate]
+    section_candidates: list[SectionCandidate]
+    localized_docs: list[LocalizedDoc]
+    localized_sections: list[LocalizedSection]
+    metadata: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable representation."""
+        return {
+            "query_understanding": self.query_understanding.to_dict(),
+            "chunk_hits": [item.to_dict() for item in self.chunk_hits],
+            "doc_candidates": [item.to_dict() for item in self.doc_candidates],
+            "section_candidates": [item.to_dict() for item in self.section_candidates],
+            "localized_docs": [item.to_dict() for item in self.localized_docs],
+            "localized_sections": [item.to_dict() for item in self.localized_sections],
+            "metadata": self.metadata,
+        }
+
+
+@dataclass(frozen=True)
+class _Stage3TreeSection:
+    """One document section loaded for Stage 3 tree localization."""
+
+    section_id: str
+    parent_id: str | None
+    doc_id: str
+    node_id: str
+    title: str
+    depth: int
+    summary: str
+    title_path: str
+
+
+def parse_query(
+    query: str,
+    *,
+    use_llm: bool = True,
+    parse_model: str = DEFAULT_PARSE_MODEL,
+    parse_fallback_model: str = DEFAULT_PARSE_FALLBACK_MODEL,
+    retrieval_profile_path: str | None = None,
+) -> QueryUnderstanding:
     """Parse one retrieval query into a structured understanding object."""
-    return _parse_query_internal(query, use_llm=use_llm, debug_recorder=None)
+    return _parse_query_internal(
+        query,
+        use_llm=use_llm,
+        parse_model=parse_model,
+        parse_fallback_model=parse_fallback_model,
+        retrieval_profile_path=retrieval_profile_path,
+        debug_recorder=None,
+    )
+
+
+def localize_sections(
+    stage12_result: RetrievalStage12Result,
+    *,
+    mode: Literal["heuristic", "hybrid"] = "hybrid",
+    top_k_docs: int | None = None,
+    top_k_anchor_sections_per_doc: int = 3,
+    top_k_tree_sections_per_doc: int = 5,
+    whole_doc_fallback: bool = True,
+    rerank_model: str = DEFAULT_PARSE_MODEL,
+    rerank_fallback_model: str = DEFAULT_PARSE_FALLBACK_MODEL,
+    stage3_shortlist_size: int = DEFAULT_STAGE3_SHORTLIST_SIZE,
+    stage3_relation_priors: dict[str, float] | None = None,
+    debug_log: bool = False,
+    debug_log_dir: str | None = None,
+) -> RetrievalStage3Result:
+    """Run Stage 3 tree localization over an existing Stage 1 + 2 result."""
+    debug_recorder = _create_debug_recorder(debug_log=debug_log, debug_log_dir=debug_log_dir)
+    started_at = time.perf_counter()
+    if debug_recorder is not None:
+        debug_recorder.set_run_metadata(
+            stage="stage3_only",
+            mode=mode,
+            top_k_docs=top_k_docs,
+            top_k_anchor_sections_per_doc=top_k_anchor_sections_per_doc,
+            top_k_tree_sections_per_doc=top_k_tree_sections_per_doc,
+            whole_doc_fallback=whole_doc_fallback,
+            rerank_model=rerank_model,
+            rerank_fallback_model=rerank_fallback_model,
+            stage3_shortlist_size=stage3_shortlist_size,
+            stage3_relation_priors=stage3_relation_priors or STAGE3_RELATION_PRIOR,
+        )
+    try:
+        return _localize_sections_internal(
+            stage12_result,
+            mode=mode,
+            top_k_docs=top_k_docs,
+            top_k_anchor_sections_per_doc=top_k_anchor_sections_per_doc,
+            top_k_tree_sections_per_doc=top_k_tree_sections_per_doc,
+            whole_doc_fallback=whole_doc_fallback,
+            rerank_model=rerank_model,
+            rerank_fallback_model=rerank_fallback_model,
+            stage3_shortlist_size=stage3_shortlist_size,
+            stage3_relation_priors=_normalize_stage3_relation_priors(stage3_relation_priors),
+            debug_recorder=debug_recorder,
+        )
+    finally:
+        if debug_recorder is not None:
+            debug_recorder.write_summary(total_duration_ms=int((time.perf_counter() - started_at) * 1000))
 
 
 def retrieve_candidates(
@@ -202,15 +365,19 @@ def retrieve_candidates(
     top_k_sections_per_doc: int = DEFAULT_TOP_K_SECTIONS_PER_DOC,
     top_k_chunks_per_section: int = DEFAULT_TOP_K_CHUNKS_PER_SECTION,
     use_llm_parse: bool = True,
+    parse_model: str = DEFAULT_PARSE_MODEL,
+    parse_fallback_model: str = DEFAULT_PARSE_FALLBACK_MODEL,
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    rrf_k: int = DEFAULT_RRF_K,
+    lexical_score_threshold: float = LEXICAL_SCORE_THRESHOLD,
+    doc_score_chunk_limit: int = DEFAULT_DOC_SCORE_CHUNK_LIMIT,
+    section_score_chunk_limit: int = DEFAULT_SECTION_SCORE_CHUNK_LIMIT,
+    retrieval_profile_path: str | None = None,
     debug_log: bool = False,
     debug_log_dir: str | None = None,
 ) -> RetrievalStage12Result:
     """Run Stage 1 and Stage 2 retrieval and return a rich handoff object."""
-    if not str(query or "").strip():
-        raise ValueError("Query must not be empty.")
-
     debug_recorder = _create_debug_recorder(debug_log=debug_log, debug_log_dir=debug_log_dir)
-    resolved_database_url = resolve_database_url()
     started_at = time.perf_counter()
     if debug_recorder is not None:
         debug_recorder.set_run_metadata(
@@ -222,99 +389,441 @@ def retrieve_candidates(
             top_k_sections_per_doc=top_k_sections_per_doc,
             top_k_chunks_per_section=top_k_chunks_per_section,
             use_llm_parse=use_llm_parse,
+            parse_model=parse_model,
+            parse_fallback_model=parse_fallback_model,
+            embedding_model=embedding_model,
+            rrf_k=rrf_k,
+            lexical_score_threshold=lexical_score_threshold,
+            doc_score_chunk_limit=doc_score_chunk_limit,
+            section_score_chunk_limit=section_score_chunk_limit,
+            retrieval_profile_path=retrieval_profile_path,
         )
-
     try:
-        with _debug_stage(debug_recorder, "parse_query"):
-            query_understanding = _parse_query_internal(query, use_llm=use_llm_parse, debug_recorder=debug_recorder)
-        if debug_recorder is not None:
-            debug_recorder.log_event("query_understanding", payload=query_understanding.to_dict())
-
-        lexical_candidate_count = 0
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            lexical_future = executor.submit(
-                _run_lexical_recall,
-                query_understanding,
-                top_k_lexical,
-                resolved_database_url,
-                debug_recorder,
-            )
-            with _debug_stage(debug_recorder, "dense_recall"):
-                load_dashscope_api_key()
-                embedding_client = DashScopeEmbeddingClient(
-                    model_name=DEFAULT_EMBEDDING_MODEL,
-                    debug_recorder=debug_recorder,
-                )
-                dense_hits = _run_dense_recall(
-                    query_understanding.normalized_query,
-                    top_k_dense,
-                    resolved_database_url,
-                    embedding_client,
-                )
-            lexical_hits, lexical_candidate_count = lexical_future.result()
-
-        with _debug_stage(debug_recorder, "fuse_chunk_hits"):
-            fused_hits = _fuse_chunk_hits(
-                dense_hits=dense_hits,
-                lexical_hits=lexical_hits,
-                top_k_fused_chunks=top_k_fused_chunks,
-            )
-        with _debug_stage(debug_recorder, "aggregate_candidates"):
-            doc_candidates, section_candidates = _aggregate_candidates(
-                fused_hits=fused_hits,
-                database_url=resolved_database_url,
-                top_k_docs=top_k_docs,
-                top_k_sections_per_doc=top_k_sections_per_doc,
-                top_k_chunks_per_section=top_k_chunks_per_section,
-            )
-
-        metadata = {
-            "settings": {
-                "top_k_dense": top_k_dense,
-                "top_k_lexical": top_k_lexical,
-                "top_k_fused_chunks": top_k_fused_chunks,
-                "top_k_docs": top_k_docs,
-                "top_k_sections_per_doc": top_k_sections_per_doc,
-                "top_k_chunks_per_section": top_k_chunks_per_section,
-                "use_llm_parse": use_llm_parse,
-                "rrf_k": DEFAULT_RRF_K,
-                "embedding_model": DEFAULT_EMBEDDING_MODEL,
-            },
-            "counts": {
-                "dense_hits": len(dense_hits),
-                "lexical_hits": len(lexical_hits),
-                "fused_chunk_hits": len(fused_hits),
-                "doc_candidates": len(doc_candidates),
-                "section_candidates": len(section_candidates),
-                "lexical_candidates": lexical_candidate_count,
-            },
-            "total_duration_ms": int((time.perf_counter() - started_at) * 1000),
-            "debug_log_dir": str(debug_recorder.base_dir) if debug_recorder is not None else None,
-        }
-        result = RetrievalStage12Result(
-            query_understanding=query_understanding,
-            chunk_hits=fused_hits,
-            doc_candidates=doc_candidates,
-            section_candidates=section_candidates,
-            metadata=metadata,
+        return _retrieve_candidates_internal(
+            query=query,
+            top_k_dense=top_k_dense,
+            top_k_lexical=top_k_lexical,
+            top_k_fused_chunks=top_k_fused_chunks,
+            top_k_docs=top_k_docs,
+            top_k_sections_per_doc=top_k_sections_per_doc,
+            top_k_chunks_per_section=top_k_chunks_per_section,
+            use_llm_parse=use_llm_parse,
+            parse_model=parse_model,
+            parse_fallback_model=parse_fallback_model,
+            embedding_model=embedding_model,
+            rrf_k=rrf_k,
+            lexical_score_threshold=lexical_score_threshold,
+            doc_score_chunk_limit=doc_score_chunk_limit,
+            section_score_chunk_limit=section_score_chunk_limit,
+            retrieval_profile_path=retrieval_profile_path,
+            debug_recorder=debug_recorder,
         )
-        if debug_recorder is not None:
-            debug_recorder.log_event("retrieval_summary", payload=result.to_dict())
-        return result
     finally:
         if debug_recorder is not None:
             debug_recorder.write_summary(total_duration_ms=int((time.perf_counter() - started_at) * 1000))
+
+
+def retrieve_tree_candidates(
+    query: str,
+    *,
+    top_k_dense: int = DEFAULT_TOP_K_DENSE,
+    top_k_lexical: int = DEFAULT_TOP_K_LEXICAL,
+    top_k_fused_chunks: int = DEFAULT_TOP_K_FUSED_CHUNKS,
+    top_k_docs: int = DEFAULT_TOP_K_DOCS,
+    top_k_sections_per_doc: int = DEFAULT_TOP_K_SECTIONS_PER_DOC,
+    top_k_chunks_per_section: int = DEFAULT_TOP_K_CHUNKS_PER_SECTION,
+    use_llm_parse: bool = True,
+    parse_model: str = DEFAULT_PARSE_MODEL,
+    parse_fallback_model: str = DEFAULT_PARSE_FALLBACK_MODEL,
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    rrf_k: int = DEFAULT_RRF_K,
+    lexical_score_threshold: float = LEXICAL_SCORE_THRESHOLD,
+    doc_score_chunk_limit: int = DEFAULT_DOC_SCORE_CHUNK_LIMIT,
+    section_score_chunk_limit: int = DEFAULT_SECTION_SCORE_CHUNK_LIMIT,
+    retrieval_profile_path: str | None = None,
+    stage3_mode: Literal["heuristic", "hybrid"] = "hybrid",
+    top_k_tree_sections_per_doc: int = 5,
+    top_k_anchor_sections_per_doc: int = 3,
+    whole_doc_fallback: bool = True,
+    rerank_model: str = DEFAULT_PARSE_MODEL,
+    rerank_fallback_model: str = DEFAULT_PARSE_FALLBACK_MODEL,
+    stage3_shortlist_size: int = DEFAULT_STAGE3_SHORTLIST_SIZE,
+    stage3_relation_priors: dict[str, float] | None = None,
+    debug_log: bool = False,
+    debug_log_dir: str | None = None,
+) -> RetrievalStage3Result:
+    """Run Stage 1 + Stage 2 + Stage 3 retrieval and return tree-localized sections."""
+    if not str(query or "").strip():
+        raise ValueError("Query must not be empty.")
+
+    debug_recorder = _create_debug_recorder(debug_log=debug_log, debug_log_dir=debug_log_dir)
+    started_at = time.perf_counter()
+    if debug_recorder is not None:
+        debug_recorder.set_run_metadata(
+            query=query,
+            top_k_dense=top_k_dense,
+            top_k_lexical=top_k_lexical,
+            top_k_fused_chunks=top_k_fused_chunks,
+            top_k_docs=top_k_docs,
+            top_k_sections_per_doc=top_k_sections_per_doc,
+            top_k_chunks_per_section=top_k_chunks_per_section,
+            use_llm_parse=use_llm_parse,
+            parse_model=parse_model,
+            parse_fallback_model=parse_fallback_model,
+            embedding_model=embedding_model,
+            rrf_k=rrf_k,
+            lexical_score_threshold=lexical_score_threshold,
+            doc_score_chunk_limit=doc_score_chunk_limit,
+            section_score_chunk_limit=section_score_chunk_limit,
+            retrieval_profile_path=retrieval_profile_path,
+            stage3_mode=stage3_mode,
+            top_k_tree_sections_per_doc=top_k_tree_sections_per_doc,
+            top_k_anchor_sections_per_doc=top_k_anchor_sections_per_doc,
+            whole_doc_fallback=whole_doc_fallback,
+            rerank_model=rerank_model,
+            rerank_fallback_model=rerank_fallback_model,
+            stage3_shortlist_size=stage3_shortlist_size,
+            stage3_relation_priors=stage3_relation_priors or STAGE3_RELATION_PRIOR,
+        )
+    try:
+        stage12_result = _retrieve_candidates_internal(
+            query=query,
+            top_k_dense=top_k_dense,
+            top_k_lexical=top_k_lexical,
+            top_k_fused_chunks=top_k_fused_chunks,
+            top_k_docs=top_k_docs,
+            top_k_sections_per_doc=top_k_sections_per_doc,
+            top_k_chunks_per_section=top_k_chunks_per_section,
+            use_llm_parse=use_llm_parse,
+            parse_model=parse_model,
+            parse_fallback_model=parse_fallback_model,
+            embedding_model=embedding_model,
+            rrf_k=rrf_k,
+            lexical_score_threshold=lexical_score_threshold,
+            doc_score_chunk_limit=doc_score_chunk_limit,
+            section_score_chunk_limit=section_score_chunk_limit,
+            retrieval_profile_path=retrieval_profile_path,
+            debug_recorder=debug_recorder,
+        )
+        return _localize_sections_internal(
+            stage12_result,
+            mode=stage3_mode,
+            top_k_docs=top_k_docs,
+            top_k_anchor_sections_per_doc=top_k_anchor_sections_per_doc,
+            top_k_tree_sections_per_doc=top_k_tree_sections_per_doc,
+            whole_doc_fallback=whole_doc_fallback,
+            rerank_model=rerank_model,
+            rerank_fallback_model=rerank_fallback_model,
+            stage3_shortlist_size=stage3_shortlist_size,
+            stage3_relation_priors=_normalize_stage3_relation_priors(stage3_relation_priors),
+            debug_recorder=debug_recorder,
+        )
+    finally:
+        if debug_recorder is not None:
+            debug_recorder.write_summary(total_duration_ms=int((time.perf_counter() - started_at) * 1000))
+
+
+def _retrieve_candidates_internal(
+    *,
+    query: str,
+    top_k_dense: int,
+    top_k_lexical: int,
+    top_k_fused_chunks: int,
+    top_k_docs: int,
+    top_k_sections_per_doc: int,
+    top_k_chunks_per_section: int,
+    use_llm_parse: bool,
+    parse_model: str,
+    parse_fallback_model: str,
+    embedding_model: str,
+    rrf_k: int,
+    lexical_score_threshold: float,
+    doc_score_chunk_limit: int,
+    section_score_chunk_limit: int,
+    retrieval_profile_path: str | None,
+    debug_recorder: DebugRecorder | None,
+) -> RetrievalStage12Result:
+    """Internal Stage 1 + Stage 2 retrieval implementation with optional shared debug state."""
+    if not str(query or "").strip():
+        raise ValueError("Query must not be empty.")
+
+    resolved_database_url = resolve_database_url()
+    started_at = time.perf_counter()
+    with _debug_stage(debug_recorder, "parse_query"):
+        query_understanding = _parse_query_internal(
+            query,
+            use_llm=use_llm_parse,
+            parse_model=parse_model,
+            parse_fallback_model=parse_fallback_model,
+            retrieval_profile_path=retrieval_profile_path,
+            debug_recorder=debug_recorder,
+        )
+    if debug_recorder is not None:
+        debug_recorder.log_event("query_understanding", payload=query_understanding.to_dict())
+
+    lexical_candidate_count = 0
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        lexical_future = executor.submit(
+            _run_lexical_recall,
+            query_understanding,
+            top_k_lexical,
+            resolved_database_url,
+            lexical_score_threshold,
+            debug_recorder,
+        )
+        with _debug_stage(debug_recorder, "dense_recall"):
+            load_dashscope_api_key()
+            embedding_client = DashScopeEmbeddingClient(
+                model_name=embedding_model,
+                debug_recorder=debug_recorder,
+            )
+            dense_hits = _run_dense_recall(
+                query_understanding.normalized_query,
+                top_k_dense,
+                resolved_database_url,
+                embedding_client,
+            )
+        lexical_hits, lexical_candidate_count = lexical_future.result()
+
+    with _debug_stage(debug_recorder, "fuse_chunk_hits"):
+        fused_hits = _fuse_chunk_hits(
+            dense_hits=dense_hits,
+            lexical_hits=lexical_hits,
+            top_k_fused_chunks=top_k_fused_chunks,
+            rrf_k=rrf_k,
+        )
+    with _debug_stage(debug_recorder, "aggregate_candidates"):
+        doc_candidates, section_candidates = _aggregate_candidates(
+            fused_hits=fused_hits,
+            database_url=resolved_database_url,
+            top_k_docs=top_k_docs,
+            top_k_sections_per_doc=top_k_sections_per_doc,
+            top_k_chunks_per_section=top_k_chunks_per_section,
+            doc_score_chunk_limit=doc_score_chunk_limit,
+            section_score_chunk_limit=section_score_chunk_limit,
+        )
+
+    metadata = {
+        "settings": {
+            "top_k_dense": top_k_dense,
+            "top_k_lexical": top_k_lexical,
+            "top_k_fused_chunks": top_k_fused_chunks,
+            "top_k_docs": top_k_docs,
+            "top_k_sections_per_doc": top_k_sections_per_doc,
+            "top_k_chunks_per_section": top_k_chunks_per_section,
+            "use_llm_parse": use_llm_parse,
+            "parse_model": parse_model,
+            "parse_fallback_model": parse_fallback_model,
+            "embedding_model": embedding_model,
+            "rrf_k": rrf_k,
+            "lexical_score_threshold": lexical_score_threshold,
+            "doc_score_chunk_limit": doc_score_chunk_limit,
+            "section_score_chunk_limit": section_score_chunk_limit,
+            "retrieval_profile_path": retrieval_profile_path,
+        },
+        "counts": {
+            "dense_hits": len(dense_hits),
+            "lexical_hits": len(lexical_hits),
+            "fused_chunk_hits": len(fused_hits),
+            "doc_candidates": len(doc_candidates),
+            "section_candidates": len(section_candidates),
+            "lexical_candidates": lexical_candidate_count,
+        },
+        "total_duration_ms": int((time.perf_counter() - started_at) * 1000),
+        "debug_log_dir": str(debug_recorder.base_dir) if debug_recorder is not None else None,
+    }
+    result = RetrievalStage12Result(
+        query_understanding=query_understanding,
+        chunk_hits=fused_hits,
+        doc_candidates=doc_candidates,
+        section_candidates=section_candidates,
+        metadata=metadata,
+    )
+    if debug_recorder is not None:
+        debug_recorder.log_event("retrieval_summary", payload=result.to_dict())
+    return result
+
+
+def _localize_sections_internal(
+    stage12_result: RetrievalStage12Result,
+    *,
+    mode: Literal["heuristic", "hybrid"],
+    top_k_docs: int | None,
+    top_k_anchor_sections_per_doc: int,
+    top_k_tree_sections_per_doc: int,
+    whole_doc_fallback: bool,
+    rerank_model: str,
+    rerank_fallback_model: str,
+    stage3_shortlist_size: int,
+    stage3_relation_priors: dict[str, float],
+    debug_recorder: DebugRecorder | None,
+) -> RetrievalStage3Result:
+    """Internal Stage 3 localization implementation with optional shared debug state."""
+    if mode not in {"heuristic", "hybrid"}:
+        raise ValueError(f"Unsupported Stage 3 mode: {mode}")
+
+    with _debug_stage(debug_recorder, "stage3_localize_sections", mode=mode):
+        selected_docs = (
+            stage12_result.doc_candidates[: int(top_k_docs)]
+            if top_k_docs is not None
+            else list(stage12_result.doc_candidates)
+        )
+        if debug_recorder is not None:
+            debug_recorder.log_event(
+                "stage3_mode_selected",
+                mode=mode,
+                selected_doc_ids=[item.doc_id for item in selected_docs],
+            )
+
+        doc_ids = [item.doc_id for item in selected_docs]
+        tree_sections_by_doc, children_by_doc = _load_tree_sections_for_docs(
+            database_url=resolve_database_url(),
+            doc_ids=doc_ids,
+        )
+        stage2_section_lookup = {
+            (item.doc_id, item.section_id): item
+            for item in stage12_result.section_candidates
+        }
+        search_terms = _derive_search_terms(stage12_result.query_understanding)
+        localized_docs: list[LocalizedDoc] = []
+        localized_sections: list[LocalizedSection] = []
+        llm_client = None
+        if mode == "hybrid":
+            load_dashscope_api_key()
+            llm_client = QwenChatClient(
+                primary_model=rerank_model,
+                fallback_model=rerank_fallback_model,
+                debug_recorder=debug_recorder,
+            )
+
+        for doc_candidate in selected_docs:
+            doc_sections = tree_sections_by_doc.get(doc_candidate.doc_id, {})
+            children_map = children_by_doc.get(doc_candidate.doc_id, {})
+            if not doc_sections:
+                if debug_recorder is not None:
+                    debug_recorder.log_event("stage3_doc_skipped", doc_id=doc_candidate.doc_id, reason="missing_tree")
+                localized_docs.append(
+                    LocalizedDoc(
+                        doc_id=doc_candidate.doc_id,
+                        doc_score=doc_candidate.doc_score,
+                        mode_used="heuristic",
+                        anchor_sections=[],
+                        localized_sections=[],
+                    )
+                )
+                continue
+
+            anchor_sections = doc_candidate.section_candidates[:top_k_anchor_sections_per_doc]
+            if debug_recorder is not None:
+                debug_recorder.log_event(
+                    "stage3_doc_selected",
+                    doc_id=doc_candidate.doc_id,
+                    tree_size=len(doc_sections),
+                    anchor_section_ids=[item.section_id for item in anchor_sections],
+                )
+            candidate_pool, used_whole_doc_fallback = _build_stage3_candidate_pool(
+                doc_id=doc_candidate.doc_id,
+                doc_sections=doc_sections,
+                children_map=children_map,
+                anchor_sections=anchor_sections,
+                stage2_section_lookup=stage2_section_lookup,
+                top_k_tree_sections_per_doc=top_k_tree_sections_per_doc,
+                whole_doc_fallback=whole_doc_fallback,
+            )
+            heuristic_sections = _score_stage3_candidates(
+                query_understanding=stage12_result.query_understanding,
+                search_terms=search_terms,
+                candidate_pool=candidate_pool,
+                top_k_tree_sections_per_doc=top_k_tree_sections_per_doc,
+                stage3_relation_priors=stage3_relation_priors,
+            )
+            if debug_recorder is not None:
+                debug_recorder.log_event(
+                    "stage3_heuristic_shortlist",
+                    doc_id=doc_candidate.doc_id,
+                    candidate_pool_size=len(candidate_pool),
+                    used_whole_doc_fallback=used_whole_doc_fallback,
+                    shortlist_section_ids=[item.section_id for item in heuristic_sections[:stage3_shortlist_size]],
+                )
+
+            mode_used: Literal["heuristic", "hybrid"] = "heuristic"
+            localized_for_doc = heuristic_sections
+            if mode == "hybrid" and llm_client is not None and heuristic_sections:
+                reranked_sections = _rerank_stage3_sections_with_llm(
+                    query_understanding=stage12_result.query_understanding,
+                    anchor_sections=anchor_sections,
+                    shortlisted_sections=heuristic_sections[:stage3_shortlist_size],
+                    top_k_tree_sections_per_doc=top_k_tree_sections_per_doc,
+                    llm_client=llm_client,
+                    rerank_model=rerank_model,
+                    debug_recorder=debug_recorder,
+                    doc_id=doc_candidate.doc_id,
+                )
+                if reranked_sections is not None:
+                    localized_for_doc = reranked_sections
+                    mode_used = "hybrid"
+                elif debug_recorder is not None:
+                    debug_recorder.log_event(
+                        "stage3_hybrid_fallback",
+                        doc_id=doc_candidate.doc_id,
+                        reason="llm_rerank_failed_or_empty",
+                    )
+
+            localized_docs.append(
+                LocalizedDoc(
+                    doc_id=doc_candidate.doc_id,
+                    doc_score=doc_candidate.doc_score,
+                    mode_used=mode_used,
+                    anchor_sections=anchor_sections,
+                    localized_sections=localized_for_doc,
+                )
+            )
+            localized_sections.extend(localized_for_doc)
+
+        stage3_metadata = {
+            "mode": mode,
+            "top_k_docs": top_k_docs,
+            "top_k_anchor_sections_per_doc": top_k_anchor_sections_per_doc,
+            "top_k_tree_sections_per_doc": top_k_tree_sections_per_doc,
+            "whole_doc_fallback": whole_doc_fallback,
+            "rerank_model": rerank_model,
+            "rerank_fallback_model": rerank_fallback_model,
+            "stage3_shortlist_size": stage3_shortlist_size,
+            "stage3_relation_priors": stage3_relation_priors,
+            "localized_doc_count": len(localized_docs),
+            "localized_section_count": len(localized_sections),
+        }
+        metadata = dict(stage12_result.metadata)
+        metadata["stage3"] = stage3_metadata
+        result = RetrievalStage3Result(
+            query_understanding=stage12_result.query_understanding,
+            chunk_hits=stage12_result.chunk_hits,
+            doc_candidates=stage12_result.doc_candidates,
+            section_candidates=stage12_result.section_candidates,
+            localized_docs=localized_docs,
+            localized_sections=localized_sections,
+            metadata=metadata,
+        )
+        if debug_recorder is not None:
+            debug_recorder.log_event("stage3_localization_summary", payload=result.to_dict())
+        return result
 
 
 def _parse_query_internal(
     query: str,
     *,
     use_llm: bool,
+    parse_model: str,
+    parse_fallback_model: str,
+    retrieval_profile_path: str | None,
     debug_recorder: DebugRecorder | None,
 ) -> QueryUnderstanding:
     """Parse a query with rule-first extraction and optional LLM enrichment."""
     normalized_query = _normalize_query(query)
-    profile_aliases = _load_retrieval_profile_aliases(debug_recorder=debug_recorder)
+    profile_aliases = _load_retrieval_profile_aliases(
+        debug_recorder=debug_recorder,
+        retrieval_profile_path=retrieval_profile_path,
+    )
     rule_result = QueryUnderstanding(
         raw_query=query,
         normalized_query=normalized_query,
@@ -341,7 +850,13 @@ def _parse_query_internal(
 
     try:
         load_dashscope_api_key()
-        enriched = _enrich_query_with_llm(rule_result, debug_recorder=debug_recorder)
+        enriched = _enrich_query_with_llm(
+            rule_result,
+            parse_model=parse_model,
+            parse_fallback_model=parse_fallback_model,
+            retrieval_profile_path=retrieval_profile_path,
+            debug_recorder=debug_recorder,
+        )
     except Exception as exc:  # noqa: PERF203
         if debug_recorder is not None:
             debug_recorder.log_event(
@@ -358,12 +873,15 @@ def _parse_query_internal(
 def _enrich_query_with_llm(
     query_understanding: QueryUnderstanding,
     *,
+    parse_model: str,
+    parse_fallback_model: str,
+    retrieval_profile_path: str | None,
     debug_recorder: DebugRecorder | None,
 ) -> QueryUnderstanding:
     """Use one LLM pass to supplement weak or missing query fields."""
     client = QwenChatClient(
-        primary_model=DEFAULT_PARSE_MODEL,
-        fallback_model=DEFAULT_PARSE_FALLBACK_MODEL,
+        primary_model=parse_model,
+        fallback_model=parse_fallback_model,
         debug_recorder=debug_recorder,
     )
     prompt = f"""
@@ -386,9 +904,12 @@ Query: {query_understanding.normalized_query}
 Current rule-based parse:
 {json.dumps(query_understanding.to_dict(), ensure_ascii=False)}
 """.strip()
-    response = client.completion(DEFAULT_PARSE_MODEL, prompt)
+    response = client.completion(parse_model, prompt)
     payload = _extract_json_payload(response)
-    profile_aliases = _load_retrieval_profile_aliases(debug_recorder=None)
+    profile_aliases = _load_retrieval_profile_aliases(
+        debug_recorder=None,
+        retrieval_profile_path=retrieval_profile_path,
+    )
     return QueryUnderstanding(
         raw_query=query_understanding.raw_query,
         normalized_query=query_understanding.normalized_query,
@@ -482,6 +1003,7 @@ def _run_lexical_recall(
     query_understanding: QueryUnderstanding,
     top_k_lexical: int,
     database_url: str,
+    lexical_score_threshold: float,
     debug_recorder: DebugRecorder | None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Run lexical recall over section chunks using generic Chinese-friendly matching."""
@@ -591,7 +1113,7 @@ def _run_lexical_recall(
                         query_understanding.normalized_query.casefold(),
                         query_understanding.normalized_query.casefold(),
                         query_understanding.normalized_query.casefold(),
-                        LEXICAL_SCORE_THRESHOLD,
+                        lexical_score_threshold,
                         int(top_k_lexical),
                     ),
                 )
@@ -614,6 +1136,7 @@ def _fuse_chunk_hits(
     dense_hits: list[dict[str, Any]],
     lexical_hits: list[dict[str, Any]],
     top_k_fused_chunks: int,
+    rrf_k: int,
 ) -> list[RetrievalChunkHit]:
     """Fuse dense and lexical hits with reciprocal rank fusion."""
     fused: dict[str, dict[str, Any]] = {}
@@ -630,9 +1153,9 @@ def _fuse_chunk_hits(
     for item in fused.values():
         rrf_score = 0.0
         if item["dense_rank"] is not None:
-            rrf_score += 1.0 / (DEFAULT_RRF_K + int(item["dense_rank"]))
+            rrf_score += 1.0 / (rrf_k + int(item["dense_rank"]))
         if item["lexical_rank"] is not None:
-            rrf_score += 1.0 / (DEFAULT_RRF_K + int(item["lexical_rank"]))
+            rrf_score += 1.0 / (rrf_k + int(item["lexical_rank"]))
         results.append(
             RetrievalChunkHit(
                 chunk_id=item["chunk_id"],
@@ -669,6 +1192,8 @@ def _aggregate_candidates(
     top_k_docs: int,
     top_k_sections_per_doc: int,
     top_k_chunks_per_section: int,
+    doc_score_chunk_limit: int,
+    section_score_chunk_limit: int,
 ) -> tuple[list[DocCandidate], list[SectionCandidate]]:
     """Aggregate fused chunk hits into doc and section candidates."""
     doc_groups: dict[str, list[RetrievalChunkHit]] = {}
@@ -694,7 +1219,7 @@ def _aggregate_candidates(
             title=str(metadata.get("title") or hits[0].title),
             depth=int(metadata.get("depth") or 0),
             summary=str(metadata.get("summary") or ""),
-            section_score=round(sum(hit.rrf_score for hit in hits[:DEFAULT_SECTION_SCORE_CHUNK_LIMIT]), 8),
+            section_score=round(sum(hit.rrf_score for hit in hits[:section_score_chunk_limit]), 8),
             matched_chunk_count=len(hits),
             supporting_chunks=[hit.to_dict() for hit in hits[:top_k_chunks_per_section]],
         )
@@ -712,7 +1237,7 @@ def _aggregate_candidates(
         doc_candidates.append(
             DocCandidate(
                 doc_id=doc_id,
-                doc_score=round(sum(hit.rrf_score for hit in hits[:DEFAULT_DOC_SCORE_CHUNK_LIMIT]), 8),
+                doc_score=round(sum(hit.rrf_score for hit in hits[:doc_score_chunk_limit]), 8),
                 matched_chunk_count=len(hits),
                 matched_section_count=len({hit.section_id for hit in hits}),
                 top_section_ids=[section.section_id for section in top_sections],
@@ -761,6 +1286,381 @@ def _load_section_metadata(*, database_url: str, section_ids: list[str]) -> dict
             return {row["section_id"]: dict(row) for row in cursor.fetchall()}
 
 
+def _load_tree_sections_for_docs(
+    *,
+    database_url: str,
+    doc_ids: list[str],
+) -> tuple[dict[str, dict[str, _Stage3TreeSection]], dict[str, dict[str | None, list[str]]]]:
+    """Load full document trees for selected docs and reconstruct title paths."""
+    if not doc_ids:
+        return {}, {}
+    psycopg, dict_row = _import_psycopg()
+    with psycopg.connect(database_url, row_factory=dict_row) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    section_id::text AS section_id,
+                    parent_id::text AS parent_id,
+                    doc_id,
+                    node_id,
+                    title,
+                    depth,
+                    summary
+                FROM document_sections
+                WHERE doc_id = ANY(%s)
+                ORDER BY doc_id, depth, title
+                """,
+                (doc_ids,),
+            )
+            rows = list(cursor.fetchall())
+
+    raw_sections_by_doc: dict[str, dict[str, dict[str, Any]]] = {}
+    children_by_doc: dict[str, dict[str | None, list[str]]] = {}
+    for row in rows:
+        doc_id = str(row["doc_id"])
+        section_id = str(row["section_id"])
+        parent_id = str(row["parent_id"]) if row["parent_id"] is not None else None
+        raw_sections_by_doc.setdefault(doc_id, {})[section_id] = {
+            "section_id": section_id,
+            "parent_id": parent_id,
+            "doc_id": doc_id,
+            "node_id": str(row["node_id"]),
+            "title": str(row["title"]),
+            "depth": int(row["depth"] or 0),
+            "summary": str(row["summary"] or ""),
+        }
+        children_by_doc.setdefault(doc_id, {}).setdefault(parent_id, []).append(section_id)
+
+    sections_by_doc: dict[str, dict[str, _Stage3TreeSection]] = {}
+    for doc_id, raw_sections in raw_sections_by_doc.items():
+        title_path_cache: dict[str, str] = {}
+
+        def build_title_path(section_id: str) -> str:
+            cached = title_path_cache.get(section_id)
+            if cached is not None:
+                return cached
+            row = raw_sections[section_id]
+            parent_id = row["parent_id"]
+            if not parent_id or parent_id not in raw_sections:
+                title_path = row["title"]
+            else:
+                title_path = f"{build_title_path(parent_id)} > {row['title']}"
+            title_path_cache[section_id] = title_path
+            return title_path
+
+        sections_by_doc[doc_id] = {
+            section_id: _Stage3TreeSection(
+                section_id=section_id,
+                parent_id=row["parent_id"],
+                doc_id=doc_id,
+                node_id=row["node_id"],
+                title=row["title"],
+                depth=row["depth"],
+                summary=row["summary"],
+                title_path=build_title_path(section_id),
+            )
+            for section_id, row in raw_sections.items()
+        }
+    return sections_by_doc, children_by_doc
+
+
+def _build_stage3_candidate_pool(
+    *,
+    doc_id: str,
+    doc_sections: dict[str, _Stage3TreeSection],
+    children_map: dict[str | None, list[str]],
+    anchor_sections: list[SectionCandidate],
+    stage2_section_lookup: dict[tuple[str, str], SectionCandidate],
+    top_k_tree_sections_per_doc: int,
+    whole_doc_fallback: bool,
+) -> tuple[dict[str, dict[str, Any]], bool]:
+    """Build the tree-local candidate pool for one document from selected anchors."""
+    candidates: dict[str, dict[str, Any]] = {}
+
+    def update_candidate(
+        section_id: str,
+        *,
+        relation_to_anchor: Literal["anchor", "descendant", "ancestor", "sibling", "doc_fallback"],
+        anchor_section: SectionCandidate | None,
+    ) -> None:
+        section = doc_sections.get(section_id)
+        if section is None:
+            return
+        stage2_section = stage2_section_lookup.get((doc_id, section_id))
+        stage2_score = stage2_section.section_score if stage2_section is not None else 0.0
+        supporting_chunks = (
+            stage2_section.supporting_chunks
+            if stage2_section is not None
+            else (anchor_section.supporting_chunks if anchor_section is not None else [])
+        )
+        reason_codes = [f"relation:{relation_to_anchor}"]
+        if stage2_section is not None:
+            reason_codes.append("stage2_section_hit")
+        elif anchor_section is not None:
+            reason_codes.append("anchor_support_transfer")
+        anchor_section_id = anchor_section.section_id if anchor_section is not None else None
+        candidate = {
+            "section": section,
+            "anchor_section_id": anchor_section_id,
+            "relation_to_anchor": relation_to_anchor,
+            "reason_codes": reason_codes,
+            "stage2_section_score": float(stage2_score),
+            "supporting_chunks": supporting_chunks,
+        }
+        existing = candidates.get(section_id)
+        if existing is None:
+            candidates[section_id] = candidate
+            return
+
+        current_priority = STAGE3_RELATION_ORDER[relation_to_anchor]
+        existing_priority = STAGE3_RELATION_ORDER[existing["relation_to_anchor"]]
+        if current_priority > existing_priority or (
+            current_priority == existing_priority and stage2_score > existing["stage2_section_score"]
+        ):
+            reason_codes = _deduplicate_strings([*existing["reason_codes"], *reason_codes])
+            candidate["reason_codes"] = reason_codes
+            candidates[section_id] = candidate
+        else:
+            existing["reason_codes"] = _deduplicate_strings([*existing["reason_codes"], *reason_codes])
+
+    for anchor_section in anchor_sections:
+        anchor_id = anchor_section.section_id
+        if anchor_id not in doc_sections:
+            continue
+        update_candidate(anchor_id, relation_to_anchor="anchor", anchor_section=anchor_section)
+
+        stack = list(children_map.get(anchor_id, []))
+        while stack:
+            child_id = stack.pop()
+            update_candidate(child_id, relation_to_anchor="descendant", anchor_section=anchor_section)
+            stack.extend(children_map.get(child_id, []))
+
+        current_parent = doc_sections[anchor_id].parent_id
+        ancestor_ids: list[str] = []
+        while current_parent:
+            if current_parent not in doc_sections:
+                break
+            ancestor_ids.append(current_parent)
+            update_candidate(current_parent, relation_to_anchor="ancestor", anchor_section=anchor_section)
+            current_parent = doc_sections[current_parent].parent_id
+
+        sibling_parent_ids = [doc_sections[anchor_id].parent_id]
+        sibling_parent_ids.extend(doc_sections[ancestor_id].parent_id for ancestor_id in ancestor_ids)
+        for parent_id in sibling_parent_ids:
+            if parent_id is None:
+                continue
+            for sibling_id in children_map.get(parent_id, []):
+                if sibling_id == anchor_id or sibling_id in ancestor_ids:
+                    continue
+                update_candidate(sibling_id, relation_to_anchor="sibling", anchor_section=anchor_section)
+
+    used_whole_doc_fallback = False
+    if len(candidates) < top_k_tree_sections_per_doc and whole_doc_fallback:
+        used_whole_doc_fallback = True
+        for section_id in doc_sections:
+            if section_id in candidates:
+                continue
+            update_candidate(section_id, relation_to_anchor="doc_fallback", anchor_section=None)
+    return candidates, used_whole_doc_fallback
+
+
+def _score_stage3_candidates(
+    *,
+    query_understanding: QueryUnderstanding,
+    search_terms: list[str],
+    candidate_pool: dict[str, dict[str, Any]],
+    top_k_tree_sections_per_doc: int,
+    stage3_relation_priors: dict[str, float],
+) -> list[LocalizedSection]:
+    """Score tree-local Stage 3 candidates with deterministic heuristics."""
+    localized_sections: list[LocalizedSection] = []
+    years = [str(year) for year in query_understanding.time_scope.get("years", [])]
+    quarters = [str(value) for value in query_understanding.time_scope.get("quarters", [])]
+
+    for candidate in candidate_pool.values():
+        section = candidate["section"]
+        title_hits = _count_term_hits(section.title, search_terms)
+        title_path_hits = _count_term_hits(section.title_path, search_terms)
+        summary_hits = _count_term_hits(section.summary, search_terms)
+        time_hits = _count_time_hits(
+            text=" ".join(filter(None, [section.title, section.title_path, section.summary])),
+            years=years,
+            quarters=quarters,
+        )
+        relation_to_anchor = candidate["relation_to_anchor"]
+        stage2_score = float(candidate["stage2_section_score"])
+        localization_score = (
+            stage3_relation_priors[relation_to_anchor]
+            + stage2_score * 100.0
+            + title_hits * 3.0
+            + title_path_hits * 2.0
+            + summary_hits * 1.0
+            + time_hits * 1.5
+        )
+        reason_codes = list(candidate["reason_codes"])
+        if title_hits:
+            reason_codes.append("title_term_match")
+        if title_path_hits:
+            reason_codes.append("title_path_term_match")
+        if summary_hits:
+            reason_codes.append("summary_term_match")
+        if time_hits:
+            reason_codes.append("time_scope_overlap")
+        if stage2_score > 0:
+            reason_codes.append("stage2_score_boost")
+        localized_sections.append(
+            LocalizedSection(
+                doc_id=section.doc_id,
+                section_id=section.section_id,
+                node_id=section.node_id,
+                parent_id=section.parent_id,
+                title=section.title,
+                depth=section.depth,
+                summary=section.summary,
+                title_path=section.title_path,
+                localization_score=round(localization_score, 8),
+                stage2_section_score=round(stage2_score, 8),
+                anchor_section_id=candidate["anchor_section_id"],
+                relation_to_anchor=relation_to_anchor,
+                reason_codes=_deduplicate_strings(reason_codes),
+                supporting_chunks=candidate["supporting_chunks"],
+            )
+        )
+
+    localized_sections.sort(
+        key=lambda item: (
+            item.localization_score,
+            STAGE3_RELATION_ORDER[item.relation_to_anchor],
+            -item.depth,
+            item.title_path,
+        ),
+        reverse=True,
+    )
+    return localized_sections[:top_k_tree_sections_per_doc]
+
+
+def _rerank_stage3_sections_with_llm(
+    *,
+    query_understanding: QueryUnderstanding,
+    anchor_sections: list[SectionCandidate],
+    shortlisted_sections: list[LocalizedSection],
+    top_k_tree_sections_per_doc: int,
+    llm_client: QwenChatClient,
+    rerank_model: str,
+    debug_recorder: DebugRecorder | None,
+    doc_id: str,
+) -> list[LocalizedSection] | None:
+    """Rerank one document's shortlisted sections with one LLM call."""
+    prompt = f"""
+You are ranking sections inside one research report for retrieval.
+Return only JSON with this shape:
+{{
+  "ranked_sections": [
+    {{"section_id": "id", "reason": "short reason"}}
+  ]
+}}
+
+Use only section_id values that appear in the shortlist.
+Prefer sections that are most likely to directly answer the query.
+
+Query understanding:
+{json.dumps(query_understanding.to_dict(), ensure_ascii=False)}
+
+Anchor sections:
+{json.dumps([section.to_dict() for section in anchor_sections], ensure_ascii=False)}
+
+Shortlisted sections:
+{json.dumps([section.to_dict() for section in shortlisted_sections], ensure_ascii=False)}
+""".strip()
+    try:
+        response = llm_client.completion(rerank_model, prompt)
+        payload = _extract_json_payload(response)
+        ranked_sections = payload.get("ranked_sections")
+        if not isinstance(ranked_sections, list):
+            raise ValueError("ranked_sections must be a list")
+    except Exception as exc:  # noqa: PERF203
+        if debug_recorder is not None:
+            debug_recorder.log_event(
+                "stage3_llm_rerank_error",
+                doc_id=doc_id,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+        return None
+
+    shortlist_lookup = {section.section_id: section for section in shortlisted_sections}
+    llm_rankings: list[tuple[LocalizedSection, str, int]] = []
+    for rank, item in enumerate(ranked_sections, start=1):
+        if not isinstance(item, dict):
+            continue
+        section_id = str(item.get("section_id") or "").strip()
+        reason = str(item.get("reason") or "").strip()
+        shortlisted = shortlist_lookup.get(section_id)
+        if shortlisted is None:
+            continue
+        llm_rankings.append((shortlisted, reason, rank))
+
+    if not llm_rankings:
+        if debug_recorder is not None:
+            debug_recorder.log_event("stage3_llm_rerank_empty", doc_id=doc_id)
+        return None
+
+    max_base_score = max(section.localization_score for section in shortlisted_sections) or 1.0
+    bonus_scale = max(1.0, max_base_score * 0.6)
+    llm_bonus_by_section = {
+        section.section_id: bonus_scale / float(rank)
+        for section, _reason, rank in llm_rankings
+    }
+    llm_reason_by_section = {
+        section.section_id: reason
+        for section, reason, _rank in llm_rankings
+        if reason
+    }
+    reranked_sections: list[LocalizedSection] = []
+    for section in shortlisted_sections:
+        reason_codes = list(section.reason_codes)
+        if section.section_id in llm_bonus_by_section:
+            reason_codes.append("llm_rerank_selected")
+        reranked_sections.append(
+            LocalizedSection(
+                doc_id=section.doc_id,
+                section_id=section.section_id,
+                node_id=section.node_id,
+                parent_id=section.parent_id,
+                title=section.title,
+                depth=section.depth,
+                summary=section.summary,
+                title_path=section.title_path,
+                localization_score=round(section.localization_score + llm_bonus_by_section.get(section.section_id, 0.0), 8),
+                stage2_section_score=section.stage2_section_score,
+                anchor_section_id=section.anchor_section_id,
+                relation_to_anchor=section.relation_to_anchor,
+                reason_codes=_deduplicate_strings(reason_codes),
+                supporting_chunks=section.supporting_chunks,
+            )
+        )
+
+    reranked_sections.sort(
+        key=lambda item: (
+            item.localization_score,
+            STAGE3_RELATION_ORDER[item.relation_to_anchor],
+            -item.depth,
+            item.title_path,
+        ),
+        reverse=True,
+    )
+    reranked_sections = reranked_sections[:top_k_tree_sections_per_doc]
+    if debug_recorder is not None:
+        debug_recorder.log_event(
+            "stage3_llm_rerank",
+            doc_id=doc_id,
+            ranked_section_ids=[section.section_id for section in reranked_sections],
+            llm_reasons=llm_reason_by_section,
+        )
+    return reranked_sections
+
+
 def _create_debug_recorder(*, debug_log: bool, debug_log_dir: str | None) -> DebugRecorder | None:
     """Create a debug recorder for retrieval runs when requested."""
     if not debug_log:
@@ -771,9 +1671,13 @@ def _create_debug_recorder(*, debug_log: bool, debug_log_dir: str | None) -> Deb
     return DebugRecorder(REPO_ROOT / "DemoIndex" / "artifacts" / "retrieval" / timestamp / "debug")
 
 
-def _load_retrieval_profile_aliases(*, debug_recorder: DebugRecorder | None) -> dict[str, dict[str, list[str]]]:
+def _load_retrieval_profile_aliases(
+    *,
+    debug_recorder: DebugRecorder | None,
+    retrieval_profile_path: str | None,
+) -> dict[str, dict[str, list[str]]]:
     """Load optional external alias mappings for query understanding."""
-    profile_path = os.getenv(DEFAULT_PROFILE_ENV_VAR)
+    profile_path = retrieval_profile_path or os.getenv(DEFAULT_PROFILE_ENV_VAR)
     if not profile_path:
         if debug_recorder is not None:
             debug_recorder.log_event("retrieval_profile_loaded", enabled=False, path=None)
@@ -798,6 +1702,18 @@ def _load_retrieval_profile_aliases(*, debug_recorder: DebugRecorder | None) -> 
     return alias_maps
 
 
+def _normalize_stage3_relation_priors(overrides: dict[str, float] | None) -> dict[str, float]:
+    """Normalize Stage 3 relation-prior overrides against the default key set."""
+    priorities = dict(STAGE3_RELATION_PRIOR)
+    if not overrides:
+        return priorities
+    for key, value in overrides.items():
+        if key not in priorities:
+            raise ValueError(f"Unsupported Stage 3 relation prior key: {key}")
+        priorities[key] = float(value)
+    return priorities
+
+
 def _normalize_profile_alias_mapping(value: Any) -> dict[str, list[str]]:
     """Normalize one alias mapping payload from the optional retrieval profile."""
     if not isinstance(value, dict):
@@ -814,11 +1730,11 @@ def _normalize_profile_alias_mapping(value: Any) -> dict[str, list[str]]:
     return results
 
 
-def _debug_stage(debug_recorder: DebugRecorder | None, stage_name: str):
+def _debug_stage(debug_recorder: DebugRecorder | None, stage_name: str, **metadata: Any):
     """Return a no-op or structured debug stage context manager."""
     if debug_recorder is None:
         return _NoOpContextManager()
-    return debug_recorder.stage(stage_name)
+    return debug_recorder.stage(stage_name, **metadata)
 
 
 def _normalize_query(query: str) -> str:
@@ -1005,6 +1921,31 @@ def _derive_search_terms(query_understanding: QueryUnderstanding) -> list[str]:
                 continue
             results.append(normalized)
     return results
+
+
+def _count_term_hits(text: str, search_terms: list[str]) -> int:
+    """Count unique search-term hits inside one text field."""
+    lowered = str(text or "").casefold()
+    hit_count = 0
+    for term in search_terms:
+        if len(term) < 2:
+            continue
+        if term.casefold() in lowered:
+            hit_count += 1
+    return hit_count
+
+
+def _count_time_hits(*, text: str, years: list[str], quarters: list[str]) -> int:
+    """Count year and quarter overlaps between the query and one text field."""
+    lowered = str(text or "").casefold()
+    hit_count = 0
+    for year in years:
+        if year and year.casefold() in lowered:
+            hit_count += 1
+    for quarter in quarters:
+        if quarter and quarter.casefold() in lowered:
+            hit_count += 1
+    return hit_count
 
 
 def _normalize_string_list(value: Any) -> list[str]:
