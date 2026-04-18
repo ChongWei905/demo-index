@@ -1,0 +1,66 @@
+{
+  "model": "text-embedding-v4",
+  "embedding_dimensions": 1024,
+  "leaf_section_count": 13,
+  "chunk_count": 93,
+  "records": [
+    {
+      "chunk_id": "aa76ee97-f81f-5203-81b5-03e9430ff619",
+      "section_id": "37c07d4a-919b-5dfb-9f10-6de0fc363005",
+      "node_id": "0001",
+      "chunk_index": 0,
+      "title": "目录",
+      "title_path": "2025年游戏应用洞察报告 > 目录",
+      "page_index": 3,
+      "token_count": 46,
+      "text_hash": "ba06c201a3fa724acfb5aa06591f951d67fa78e6d3a1fcbe14d65b08ef7027aa"
+    },
+    {
+      "chunk_id": "ffa147ee-aef6-512e-aae1-0bc8d1af552b",
+      "section_id": "37c07d4a-919b-5dfb-9f10-6de0fc363005",
+      "node_id": "0001",
+      "chunk_index": 1,
+      "title": "目录",
+      "title_path": "2025年游戏应用洞察报告 > 目录",
+      "page_index": 3,
+      "token_count": 384,
+      "text_hash": "08b02abd69d54817bc12d43524ecdecba5cc81aee7faa20d70e5467799106494"
+    },
+    {
+      "chunk_id": "cf137345-485e-5ba4-ad6b-983b54a99be7",
+      "section_id": "37c07d4a-919b-5dfb-9f10-6de0fc363005",
+      "node_id": "0001",
+      "chunk_index": 2,
+      "title": "目录",
+      "title_path": "2025年游戏应用洞察报告 > 目录",
+      "page_index": 3,
+      "token_count": 378,
+      "text_hash": "192aa39c93609e8d955e3678e5c86c0779be65a040b7fc382dc7b699752aef1e"
+    },
+    {
+      "chunk_id": "38883e0c-3b00-552d-a800-0c74893d4091",
+      "section_id": "37c07d4a-919b-5dfb-9f10-6de0fc363005",
+      "node_id": "0001",
+      "chunk_index": 3,
+      "title": "目录",
+      "title_path": "2025年游戏应用洞察报告 > 目录",
+      "page_index": 3,
+      "token_count": 351,
+      "text_hash": "a4e8db81f56239d072027dbe554e4f884c1a8d8a9d72a1de37543e35560dc44b"
+    },
+    {
+      "chunk_id": "12baf8fb-d68a-5107-9c76-0b631815243a",
+      "section_id": "37c07d4a-919b-5dfb-9f10-6de0fc363005",
+      "node_id": "0001",
+      "chunk_index": 4,
+      "title": "目录",
+      "title_path": "2025年游戏应用洞察报告 > 目录",
+      "page_index": 3,
+      "token_count": 393,
+      "text_hash": "516d670a484d48604754bd225531bf44f0afbc8e99cb6aeb1f8bf2e2cb5360ef"
+    }
+  ],
+  "table_name": "section_chunks",
+  "doc_id": "6638bb01-25a0-5ddb-a56a-8d40c2adb718",
+  "row_count": 93
+}

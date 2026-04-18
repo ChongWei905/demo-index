@@ -1,0 +1,111 @@
+{
+  "run_metadata": {
+    "query": "2024 全球手游 CPI 和留存趋势",
+    "top_k_dense": 10,
+    "top_k_lexical": 10,
+    "top_k_fused_chunks": 12,
+    "top_k_docs": 2,
+    "top_k_sections_per_doc": 2,
+    "top_k_chunks_per_section": 1,
+    "use_llm_parse": false,
+    "parse_model": "dashscope/qwen3.6-plus",
+    "parse_fallback_model": "dashscope/qwen3.5-plus",
+    "embedding_model": "text-embedding-v4",
+    "rrf_k": 60,
+    "lexical_score_threshold": 0.18,
+    "doc_score_chunk_limit": 5,
+    "section_score_chunk_limit": 3,
+    "retrieval_profile_path": null,
+    "stage3_mode": "hybrid",
+    "top_k_tree_sections_per_doc": 3,
+    "top_k_anchor_sections_per_doc": 2,
+    "whole_doc_fallback": true,
+    "rerank_model": "dashscope/qwen3.6-plus",
+    "rerank_fallback_model": "dashscope/qwen3.5-plus",
+    "stage3_shortlist_size": 8,
+    "stage3_relation_priors": {
+      "anchor": 4.0,
+      "descendant": 2.75,
+      "ancestor": 2.1,
+      "sibling": 1.45,
+      "doc_fallback": 0.55
+    },
+    "top_k_focus_sections_per_doc": 2,
+    "max_ancestor_hops": 2,
+    "max_descendant_depth": 1,
+    "max_siblings_per_focus": 2,
+    "chunk_neighbor_window": 1,
+    "max_evidence_chunks_per_focus": 6,
+    "context_char_budget": 6000,
+    "stage5_relation_mode": "hybrid",
+    "top_k_evidence_per_doc": 2,
+    "top_k_total_evidence": 4,
+    "stage5_relation_model": "dashscope/qwen3.6-plus",
+    "stage5_relation_fallback_model": "dashscope/qwen3.5-plus",
+    "stage5_relation_shortlist_size": 8
+  },
+  "stage_records": [
+    {
+      "stage": "parse_query",
+      "status": "success",
+      "started_at": "2026-04-18T01:52:00.473221+00:00",
+      "duration_ms": 1
+    },
+    {
+      "stage": "lexical_recall",
+      "status": "success",
+      "started_at": "2026-04-18T01:52:00.475041+00:00",
+      "duration_ms": 31
+    },
+    {
+      "stage": "dense_recall",
+      "status": "success",
+      "started_at": "2026-04-18T01:52:00.474990+00:00",
+      "duration_ms": 2866
+    },
+    {
+      "stage": "fuse_chunk_hits",
+      "status": "success",
+      "started_at": "2026-04-18T01:52:03.342301+00:00",
+      "duration_ms": 0
+    },
+    {
+      "stage": "aggregate_candidates",
+      "status": "success",
+      "started_at": "2026-04-18T01:52:03.342832+00:00",
+      "duration_ms": 8
+    },
+    {
+      "stage": "stage3_localize_sections",
+      "status": "success",
+      "started_at": "2026-04-18T01:52:03.352153+00:00",
+      "duration_ms": 33438,
+      "mode": "hybrid"
+    },
+    {
+      "stage": "stage4_expand_contexts",
+      "status": "success",
+      "started_at": "2026-04-18T01:52:36.791471+00:00",
+      "duration_ms": 24
+    },
+    {
+      "stage": "stage5_package_evidence",
+      "status": "success",
+      "started_at": "2026-04-18T01:52:36.816293+00:00",
+      "duration_ms": 41267,
+      "relation_mode": "hybrid"
+    }
+  ],
+  "llm_usage_totals": {
+    "prompt_tokens": 7887,
+    "completion_tokens": 3638,
+    "total_tokens": 11525
+  },
+  "llm_call_counts": {
+    "chat": 2,
+    "embedding": 1,
+    "success": 3,
+    "error": 0
+  },
+  "total_duration_ms": 77612
+}
