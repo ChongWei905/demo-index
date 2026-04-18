@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import os
 import hashlib
 import uuid
 from dataclasses import asdict, dataclass
 from typing import Any
+
+from .env import get_demoindex_config
 
 
 SECTION_TABLE_NAME = "document_sections"
@@ -192,11 +193,12 @@ def persist_section_chunks(
     """Persist one document's global chunk index into PostgreSQL."""
     resolved_database_url = resolve_database_url(database_url)
     psycopg = _import_psycopg()
+    embedding_dimension = _resolve_chunk_embedding_dimension(chunk_records)
 
     with psycopg.connect(resolved_database_url) as connection:
         with connection.transaction():
             with connection.cursor() as cursor:
-                _ensure_chunk_schema(cursor)
+                _ensure_chunk_schema(cursor, embedding_dimension=embedding_dimension)
                 cursor.execute(
                     f"DELETE FROM {CHUNK_TABLE_NAME} WHERE doc_id = %s",
                     (doc_id,),
@@ -236,7 +238,10 @@ def persist_section_chunks(
                                 record.search_text,
                                 record.token_count,
                                 record.text_hash,
-                                _vector_literal(record.embedding),
+                                _vector_literal(
+                                    record.embedding,
+                                    expected_dimension=embedding_dimension,
+                                ),
                             )
                             for record in chunk_records
                         ],
@@ -265,9 +270,11 @@ def persist_section_chunks(
 
 def resolve_database_url(database_url: str | None = None) -> str:
     """Resolve the PostgreSQL connection string from arguments or environment."""
-    resolved_database_url = str(database_url or os.getenv("DATABASE_URL") or "").strip()
+    resolved_database_url = str(database_url or get_demoindex_config().database_url or "").strip()
     if not resolved_database_url:
-        raise RuntimeError("DATABASE_URL is required when PostgreSQL persistence is enabled.")
+        raise RuntimeError(
+            "PostgreSQL persistence requires `database_url` or DEMOINDEX_DATABASE_URL."
+        )
     return resolved_database_url
 
 
@@ -327,7 +334,7 @@ def _ensure_section_schema(cursor) -> None:
     )
 
 
-def _ensure_chunk_schema(cursor) -> None:
+def _ensure_chunk_schema(cursor, *, embedding_dimension: int) -> None:
     """Create the section_chunks table, extensions, and supporting indexes when missing."""
     cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
     cursor.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
@@ -346,7 +353,7 @@ def _ensure_chunk_schema(cursor) -> None:
             search_text TEXT NOT NULL,
             token_count INTEGER NOT NULL,
             text_hash TEXT NOT NULL,
-            embedding vector({EMBEDDING_DIMENSION}) NOT NULL
+            embedding vector({embedding_dimension}) NOT NULL
         )
         """
     )
@@ -380,6 +387,14 @@ def _ensure_chunk_schema(cursor) -> None:
     )
 
 
+def _resolve_chunk_embedding_dimension(chunk_records: list[ChunkRecord]) -> int:
+    """Resolve the embedding dimension expected by the chunk table schema."""
+    if chunk_records:
+        return len(chunk_records[0].embedding)
+    configured_dimension = get_demoindex_config().embedding.dimensions
+    return int(configured_dimension or EMBEDDING_DIMENSION)
+
+
 def _coerce_page_index(value: Any) -> int | None:
     """Convert page indexes to ints when possible."""
     if value in {None, ""}:
@@ -390,10 +405,10 @@ def _coerce_page_index(value: Any) -> int | None:
         return None
 
 
-def _vector_literal(values: list[float]) -> str:
+def _vector_literal(values: list[float], *, expected_dimension: int) -> str:
     """Convert a Python float vector into a PostgreSQL vector literal."""
-    if len(values) != EMBEDDING_DIMENSION:
+    if len(values) != expected_dimension:
         raise ValueError(
-            f"Embedding dimension mismatch: expected {EMBEDDING_DIMENSION}, got {len(values)}."
+            f"Embedding dimension mismatch: expected {expected_dimension}, got {len(values)}."
         )
     return "[" + ",".join(f"{float(value):.10f}" for value in values) + "]"

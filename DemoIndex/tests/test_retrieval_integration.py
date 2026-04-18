@@ -33,7 +33,7 @@ class _FakeEmbeddingClient:
     """Return one known embedding vector to avoid network calls in tests."""
 
     def __init__(self, *_args, **_kwargs) -> None:
-        self._vector = _load_one_embedding(os.environ["DATABASE_URL"])
+        self._vector = _load_one_embedding(os.environ["DEMOINDEX_DATABASE_URL"])
 
     def embed_queries(self, texts: list[str]) -> list[list[float]]:
         """Return the same valid-dimension vector for every query."""
@@ -93,8 +93,8 @@ class RetrievalIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         """Prepare the local database URL or skip when PostgreSQL is unavailable."""
-        cls.database_url = os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL
-        os.environ["DATABASE_URL"] = cls.database_url
+        cls.database_url = os.getenv("DEMOINDEX_DATABASE_URL") or DEFAULT_DATABASE_URL
+        os.environ["DEMOINDEX_DATABASE_URL"] = cls.database_url
 
     def test_retrieve_candidates_returns_ranked_results(self) -> None:
         """The retrieval API should return chunk, doc, and section results with lexical support."""
@@ -204,7 +204,6 @@ class RetrievalIntegrationTests(unittest.TestCase):
         with (
             patch("DemoIndex.retrieval.DashScopeEmbeddingClient", _FakeEmbeddingClient),
             patch("DemoIndex.retrieval.QwenChatClient", _FakeStage3ChatClient),
-            patch("DemoIndex.retrieval.load_dashscope_api_key"),
             patch("sys.argv", argv),
             patch("sys.stdout", stdout),
         ):

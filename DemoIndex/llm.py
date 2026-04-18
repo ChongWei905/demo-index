@@ -1,53 +1,75 @@
-"""DashScope OpenAI-compatible helpers for DemoIndex."""
+"""OpenAI-compatible chat and embedding helpers for DemoIndex."""
 
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from typing import Any
 
 from openai import AsyncOpenAI, OpenAI
 
+from .env import (
+    DEFAULT_DASHSCOPE_BASE_URL,
+    DEFAULT_LLM_RETRY_BASE_SECONDS,
+    DEFAULT_OPENAI_BASE_URL,
+    DEFAULT_DASHSCOPE_EMBEDDING_DIMENSIONS,
+    get_demoindex_config,
+)
+
 
 class QwenChatClient:
-    """A small DashScope OpenAI-compatible wrapper for PageIndex prompt calls."""
+    """A provider-aware OpenAI-compatible wrapper for DemoIndex chat calls."""
 
     def __init__(
         self,
         api_key: str | None = None,
+        provider: str | None = None,
+        base_url: str | None = None,
         primary_model: str | None = None,
         fallback_model: str | None = None,
-        timeout_seconds: float = 180.0,
-        max_retries: int = 4,
-        max_concurrency: int = 4,
+        timeout_seconds: float | None = None,
+        max_retries: int | None = None,
+        retry_base_seconds: float | None = None,
+        max_concurrency: int | None = None,
         debug_recorder: Any | None = None,
     ) -> None:
-        resolved_api_key = api_key or os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")
+        config = get_demoindex_config().llm
+        resolved_api_key = api_key or config.api_key
         if not resolved_api_key:
-            raise RuntimeError("Missing DashScope API key.")
+            raise RuntimeError(
+                "Missing DemoIndex chat API key. Set DEMOINDEX_LLM_API_KEY in DemoIndex/.env "
+                "or the current environment."
+            )
+        self.provider = str(provider or config.provider)
+        self.base_url = str(
+            base_url
+            or (config.base_url if provider is None else _default_base_url_for_provider(self.provider))
+        )
+        self.timeout_seconds = float(timeout_seconds or config.timeout_seconds)
+        self.max_retries = int(max_retries or config.max_retries)
+        self.retry_base_seconds = float(retry_base_seconds or config.retry_base_seconds)
+        self.max_concurrency = int(max_concurrency or config.max_concurrency)
+        self.primary_model = self._normalize_model_name(primary_model)
+        self.fallback_model = self._normalize_model_name(fallback_model)
+        self.debug_recorder = debug_recorder
         self._client = OpenAI(
             api_key=resolved_api_key,
-            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-            timeout=timeout_seconds,
+            base_url=self.base_url,
+            timeout=self.timeout_seconds,
         )
         self._async_client = AsyncOpenAI(
             api_key=resolved_api_key,
-            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-            timeout=timeout_seconds,
+            base_url=self.base_url,
+            timeout=self.timeout_seconds,
         )
-        self.primary_model = self._normalize_model_name(primary_model)
-        self.fallback_model = self._normalize_model_name(fallback_model)
-        self.timeout_seconds = timeout_seconds
-        self.max_retries = max_retries
-        self.max_concurrency = max_concurrency
-        self.debug_recorder = debug_recorder
         self._semaphores: dict[int, asyncio.Semaphore] = {}
 
     @staticmethod
     def _normalize_model_name(model_name: str | None) -> str | None:
-        """Normalize provider-qualified model names for DashScope's API."""
+        """Normalize optional provider-qualified model names."""
         if not model_name:
+            return model_name
+        if "/" not in model_name:
             return model_name
         return model_name.split("/", 1)[-1]
 
@@ -118,6 +140,10 @@ class QwenChatClient:
             error_message=str(error) if error else None,
         )
 
+    def _sleep_seconds(self, attempt: int) -> float:
+        """Return the bounded retry sleep duration for one attempt number."""
+        return min(8.0, self.retry_base_seconds * attempt)
+
     def _get_semaphore(self) -> asyncio.Semaphore:
         """Return an async semaphore scoped to the current event loop."""
         loop = asyncio.get_running_loop()
@@ -176,9 +202,13 @@ class QwenChatClient:
                         messages=messages,
                         error=exc,
                     )
-                    print(f"[qwen-sync-retry] model={candidate} attempt={attempt} error={exc}", flush=True)
+                    print(
+                        f"[llm-sync-retry] provider={self.provider} model={candidate} "
+                        f"attempt={attempt} error={exc}",
+                        flush=True,
+                    )
                     if attempt < self.max_retries:
-                        time.sleep(min(8.0, 1.5 * attempt))
+                        time.sleep(self._sleep_seconds(attempt))
                         continue
                     break
         if last_error is None:
@@ -227,9 +257,13 @@ class QwenChatClient:
                             messages=messages,
                             error=exc,
                         )
-                        print(f"[qwen-async-retry] model={candidate} attempt={attempt} error={exc}", flush=True)
+                        print(
+                            f"[llm-async-retry] provider={self.provider} model={candidate} "
+                            f"attempt={attempt} error={exc}",
+                            flush=True,
+                        )
                         if attempt < self.max_retries:
-                            await asyncio.sleep(min(8.0, 1.5 * attempt))
+                            await asyncio.sleep(self._sleep_seconds(attempt))
                             continue
                         break
         if last_error is None:
@@ -238,37 +272,65 @@ class QwenChatClient:
 
 
 class DashScopeEmbeddingClient:
-    """A small DashScope OpenAI-compatible wrapper for embedding calls."""
+    """A provider-aware OpenAI-compatible wrapper for DemoIndex embeddings."""
 
     def __init__(
         self,
         api_key: str | None = None,
+        provider: str | None = None,
+        base_url: str | None = None,
         model_name: str = "text-embedding-v4",
-        dimensions: int = 1024,
-        timeout_seconds: float = 180.0,
-        max_retries: int = 4,
-        max_batch_size: int = 10,
+        dimensions: int | None = None,
+        timeout_seconds: float | None = None,
+        max_retries: int | None = None,
+        retry_base_seconds: float | None = None,
+        max_batch_size: int | None = None,
         debug_recorder: Any | None = None,
     ) -> None:
-        resolved_api_key = api_key or os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")
+        config = get_demoindex_config().embedding
+        resolved_api_key = api_key or config.api_key
         if not resolved_api_key:
-            raise RuntimeError("Missing DashScope API key.")
-        self._client = OpenAI(
-            api_key=resolved_api_key,
-            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-            timeout=timeout_seconds,
+            raise RuntimeError(
+                "Missing DemoIndex embedding API key. Set DEMOINDEX_EMBEDDING_API_KEY in DemoIndex/.env "
+                "or the current environment."
+            )
+        self.provider = str(provider or config.provider)
+        self.base_url = str(
+            base_url
+            or (config.base_url if provider is None else _default_base_url_for_provider(self.provider))
         )
         self.model_name = self._normalize_model_name(model_name) or "text-embedding-v4"
-        self.dimensions = int(dimensions)
-        self.timeout_seconds = timeout_seconds
-        self.max_retries = max_retries
-        self.max_batch_size = min(10, max(1, int(max_batch_size)))
+        self.timeout_seconds = float(timeout_seconds or config.timeout_seconds)
+        self.max_retries = int(max_retries or config.max_retries)
+        self.retry_base_seconds = float(
+            retry_base_seconds or getattr(config, "retry_base_seconds", DEFAULT_LLM_RETRY_BASE_SECONDS)
+        )
+        self.max_batch_size = max(1, int(max_batch_size or config.max_batch_size))
+        if dimensions is None:
+            if provider is None:
+                self._request_dimensions = config.dimensions
+            else:
+                self._request_dimensions = (
+                    DEFAULT_DASHSCOPE_EMBEDDING_DIMENSIONS
+                    if self.provider == "dashscope"
+                    else None
+                )
+        else:
+            self._request_dimensions = int(dimensions)
+        self.dimensions = self._request_dimensions
         self.debug_recorder = debug_recorder
+        self._client = OpenAI(
+            api_key=resolved_api_key,
+            base_url=self.base_url,
+            timeout=self.timeout_seconds,
+        )
 
     @staticmethod
     def _normalize_model_name(model_name: str | None) -> str | None:
-        """Normalize provider-qualified model names for DashScope's API."""
+        """Normalize optional provider-qualified model names."""
         if not model_name:
+            return model_name
+        if "/" not in model_name:
             return model_name
         return model_name.split("/", 1)[-1]
 
@@ -305,6 +367,10 @@ class DashScopeEmbeddingClient:
             error_message=str(error) if error else None,
         )
 
+    def _sleep_seconds(self, attempt: int) -> float:
+        """Return the bounded retry sleep duration for one attempt number."""
+        return min(8.0, self.retry_base_seconds * attempt)
+
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         """Embed document-side texts in batches and validate vector dimensions."""
         return self._embed_texts(texts, text_type="document")
@@ -324,6 +390,35 @@ class DashScopeEmbeddingClient:
             vectors.extend(self._embed_batch(batch, text_type=text_type))
         return vectors
 
+    def _build_embedding_request(self, texts: list[str], *, text_type: str) -> dict[str, Any]:
+        """Build one provider-aware embedding request payload."""
+        request: dict[str, Any] = {
+            "model": self.model_name,
+            "input": texts,
+            "encoding_format": "float",
+        }
+        if self._request_dimensions is not None:
+            request["dimensions"] = self._request_dimensions
+        if self.provider == "dashscope":
+            request["extra_body"] = {"text_type": text_type}
+        return request
+
+    def _validate_vectors(self, vectors: list[list[float]], *, texts: list[str]) -> None:
+        """Validate vector count and dimensions for one response batch."""
+        if len(vectors) != len(texts):
+            raise RuntimeError(
+                f"Embedding batch size mismatch: expected {len(texts)}, got {len(vectors)}."
+            )
+        if self._request_dimensions is not None:
+            for vector in vectors:
+                if len(vector) != self._request_dimensions:
+                    raise RuntimeError(
+                        f"Embedding dimension mismatch for {self.model_name}: "
+                        f"expected {self._request_dimensions}, got {len(vector)}."
+                    )
+        if self.dimensions is None and vectors:
+            self.dimensions = len(vectors[0])
+
     def _embed_batch(self, texts: list[str], *, text_type: str) -> list[list[float]]:
         """Embed one batch with retries."""
         last_error: Exception | None = None
@@ -331,25 +426,13 @@ class DashScopeEmbeddingClient:
             start_time = time.time()
             try:
                 response = self._client.embeddings.create(
-                    model=self.model_name,
-                    input=texts,
-                    dimensions=self.dimensions,
-                    encoding_format="float",
-                    extra_body={"text_type": text_type},
+                    **self._build_embedding_request(texts, text_type=text_type)
                 )
-                vectors: list[list[float]] = []
-                for item in self._sort_embedding_rows(list(response.data)):
-                    vector = list(item.embedding or [])
-                    if len(vector) != self.dimensions:
-                        raise RuntimeError(
-                            f"Embedding dimension mismatch for {self.model_name}: "
-                            f"expected {self.dimensions}, got {len(vector)}."
-                        )
-                    vectors.append(vector)
-                if len(vectors) != len(texts):
-                    raise RuntimeError(
-                        f"Embedding batch size mismatch: expected {len(texts)}, got {len(vectors)}."
-                    )
+                vectors = [
+                    list(item.embedding or [])
+                    for item in self._sort_embedding_rows(list(response.data))
+                ]
+                self._validate_vectors(vectors, texts=texts)
                 self._log_embedding_call(
                     status="success",
                     duration_ms=int((time.time() - start_time) * 1000),
@@ -368,14 +451,21 @@ class DashScopeEmbeddingClient:
                     error=exc,
                 )
                 print(
-                    f"[dashscope-embedding-retry] model={self.model_name} "
+                    f"[embedding-retry] provider={self.provider} model={self.model_name} "
                     f"attempt={attempt} error={exc}",
                     flush=True,
                 )
                 if attempt < self.max_retries:
-                    time.sleep(min(8.0, 1.5 * attempt))
+                    time.sleep(self._sleep_seconds(attempt))
                     continue
                 break
         if last_error is None:
             raise RuntimeError("Embedding batch failed without a captured exception.")
         raise last_error
+
+
+def _default_base_url_for_provider(provider: str) -> str:
+    """Return the default base URL for one supported provider."""
+    if provider == "dashscope":
+        return DEFAULT_DASHSCOPE_BASE_URL
+    return DEFAULT_OPENAI_BASE_URL

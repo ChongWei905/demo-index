@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 import uuid
@@ -14,35 +13,58 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .debug import DebugRecorder
-from .env import REPO_ROOT, load_dashscope_api_key
+from .env import (
+    REPO_ROOT,
+    DEFAULT_RETRIEVAL_DOC_SCORE_CHUNK_LIMIT,
+    DEFAULT_RETRIEVAL_EMBEDDING_MODEL,
+    DEFAULT_RETRIEVAL_LEXICAL_SCORE_THRESHOLD,
+    DEFAULT_RETRIEVAL_PARSE_FALLBACK_MODEL,
+    DEFAULT_RETRIEVAL_PARSE_MODEL,
+    DEFAULT_RETRIEVAL_RRF_K,
+    DEFAULT_RETRIEVAL_SECTION_SCORE_CHUNK_LIMIT,
+    DEFAULT_RETRIEVAL_TOP_K_CHUNKS_PER_SECTION,
+    DEFAULT_RETRIEVAL_TOP_K_DENSE,
+    DEFAULT_RETRIEVAL_TOP_K_DOCS,
+    DEFAULT_RETRIEVAL_TOP_K_FUSED_CHUNKS,
+    DEFAULT_RETRIEVAL_TOP_K_LEXICAL,
+    DEFAULT_RETRIEVAL_TOP_K_SECTIONS_PER_DOC,
+    DEFAULT_STAGE3_RELATION_PRIORS,
+    DEFAULT_STAGE4_CHUNK_NEIGHBOR_WINDOW,
+    DEFAULT_STAGE4_CONTEXT_CHAR_BUDGET,
+    DEFAULT_STAGE4_MAX_ANCESTOR_HOPS,
+    DEFAULT_STAGE4_MAX_DESCENDANT_DEPTH,
+    DEFAULT_STAGE4_MAX_EVIDENCE_CHUNKS_PER_FOCUS,
+    DEFAULT_STAGE4_MAX_SIBLINGS_PER_FOCUS,
+    DEFAULT_STAGE4_TOP_K_FOCUS_SECTIONS_PER_DOC,
+    DEFAULT_STAGE5_TOP_K_EVIDENCE_PER_DOC,
+    DEFAULT_STAGE5_TOP_K_TOTAL_EVIDENCE,
+    get_demoindex_config,
+)
 from .llm import DashScopeEmbeddingClient, QwenChatClient
 from .postgres_store import resolve_database_url
 
 
-DEFAULT_PARSE_MODEL = "dashscope/qwen3.6-plus"
-DEFAULT_PARSE_FALLBACK_MODEL = "dashscope/qwen3.5-plus"
-DEFAULT_EMBEDDING_MODEL = "text-embedding-v4"
-DEFAULT_TOP_K_DENSE = 60
-DEFAULT_TOP_K_LEXICAL = 60
-DEFAULT_TOP_K_FUSED_CHUNKS = 80
-DEFAULT_TOP_K_DOCS = 10
-DEFAULT_TOP_K_SECTIONS_PER_DOC = 3
-DEFAULT_TOP_K_CHUNKS_PER_SECTION = 2
-DEFAULT_DOC_SCORE_CHUNK_LIMIT = 5
-DEFAULT_SECTION_SCORE_CHUNK_LIMIT = 3
-DEFAULT_RRF_K = 60
-DEFAULT_PROFILE_ENV_VAR = "DEMOINDEX_RETRIEVAL_PROFILE_PATH"
-DEFAULT_TOP_K_FOCUS_SECTIONS_PER_DOC = 3
-DEFAULT_MAX_ANCESTOR_HOPS = 2
-DEFAULT_MAX_DESCENDANT_DEPTH = 1
-DEFAULT_MAX_SIBLINGS_PER_FOCUS = 2
-DEFAULT_CHUNK_NEIGHBOR_WINDOW = 1
-DEFAULT_MAX_EVIDENCE_CHUNKS_PER_FOCUS = 6
-DEFAULT_CONTEXT_CHAR_BUDGET = 6000
-DEFAULT_STAGE5_RELATION_MODE = "heuristic"
-DEFAULT_TOP_K_EVIDENCE_PER_DOC = 3
-DEFAULT_TOP_K_TOTAL_EVIDENCE = 8
-DEFAULT_STAGE5_RELATION_SHORTLIST_SIZE = 8
+DEFAULT_PARSE_MODEL = DEFAULT_RETRIEVAL_PARSE_MODEL
+DEFAULT_PARSE_FALLBACK_MODEL = DEFAULT_RETRIEVAL_PARSE_FALLBACK_MODEL
+DEFAULT_EMBEDDING_MODEL = DEFAULT_RETRIEVAL_EMBEDDING_MODEL
+DEFAULT_TOP_K_DENSE = DEFAULT_RETRIEVAL_TOP_K_DENSE
+DEFAULT_TOP_K_LEXICAL = DEFAULT_RETRIEVAL_TOP_K_LEXICAL
+DEFAULT_TOP_K_FUSED_CHUNKS = DEFAULT_RETRIEVAL_TOP_K_FUSED_CHUNKS
+DEFAULT_TOP_K_DOCS = DEFAULT_RETRIEVAL_TOP_K_DOCS
+DEFAULT_TOP_K_SECTIONS_PER_DOC = DEFAULT_RETRIEVAL_TOP_K_SECTIONS_PER_DOC
+DEFAULT_TOP_K_CHUNKS_PER_SECTION = DEFAULT_RETRIEVAL_TOP_K_CHUNKS_PER_SECTION
+DEFAULT_DOC_SCORE_CHUNK_LIMIT = DEFAULT_RETRIEVAL_DOC_SCORE_CHUNK_LIMIT
+DEFAULT_SECTION_SCORE_CHUNK_LIMIT = DEFAULT_RETRIEVAL_SECTION_SCORE_CHUNK_LIMIT
+DEFAULT_RRF_K = DEFAULT_RETRIEVAL_RRF_K
+DEFAULT_TOP_K_FOCUS_SECTIONS_PER_DOC = DEFAULT_STAGE4_TOP_K_FOCUS_SECTIONS_PER_DOC
+DEFAULT_MAX_ANCESTOR_HOPS = DEFAULT_STAGE4_MAX_ANCESTOR_HOPS
+DEFAULT_MAX_DESCENDANT_DEPTH = DEFAULT_STAGE4_MAX_DESCENDANT_DEPTH
+DEFAULT_MAX_SIBLINGS_PER_FOCUS = DEFAULT_STAGE4_MAX_SIBLINGS_PER_FOCUS
+DEFAULT_CHUNK_NEIGHBOR_WINDOW = DEFAULT_STAGE4_CHUNK_NEIGHBOR_WINDOW
+DEFAULT_MAX_EVIDENCE_CHUNKS_PER_FOCUS = DEFAULT_STAGE4_MAX_EVIDENCE_CHUNKS_PER_FOCUS
+DEFAULT_CONTEXT_CHAR_BUDGET = DEFAULT_STAGE4_CONTEXT_CHAR_BUDGET
+DEFAULT_TOP_K_EVIDENCE_PER_DOC = DEFAULT_STAGE5_TOP_K_EVIDENCE_PER_DOC
+DEFAULT_TOP_K_TOTAL_EVIDENCE = DEFAULT_STAGE5_TOP_K_TOTAL_EVIDENCE
 
 INTENT_PATTERNS = {
     "trend": ["trend", "trends", "趋势", "变化", "走势"],
@@ -93,14 +115,8 @@ STOP_TERMS = {
 LEADING_CJK_CONNECTOR_RE = re.compile(r"^[的和与及并就把将向对从在按为于]+")
 TRAILING_CJK_CONNECTOR_RE = re.compile(r"(的|和|与|及|并|等|方面|情况)+$")
 PROFILE_FIELD_NAMES = ("metrics", "regions", "platforms", "genres")
-LEXICAL_SCORE_THRESHOLD = 0.18
-STAGE3_RELATION_PRIOR = {
-    "anchor": 4.0,
-    "descendant": 2.75,
-    "ancestor": 2.1,
-    "sibling": 1.45,
-    "doc_fallback": 0.55,
-}
+LEXICAL_SCORE_THRESHOLD = DEFAULT_RETRIEVAL_LEXICAL_SCORE_THRESHOLD
+STAGE3_RELATION_PRIOR = dict(DEFAULT_STAGE3_RELATION_PRIORS)
 STAGE3_RELATION_ORDER = {
     "anchor": 5,
     "descendant": 4,
@@ -108,7 +124,6 @@ STAGE3_RELATION_ORDER = {
     "sibling": 2,
     "doc_fallback": 1,
 }
-DEFAULT_STAGE3_SHORTLIST_SIZE = 8
 
 
 @dataclass(frozen=True)
@@ -495,18 +510,19 @@ class _Stage4ChunkRow:
 def parse_query(
     query: str,
     *,
-    use_llm: bool = True,
-    parse_model: str = DEFAULT_PARSE_MODEL,
-    parse_fallback_model: str = DEFAULT_PARSE_FALLBACK_MODEL,
+    use_llm: bool | None = None,
+    parse_model: str | None = None,
+    parse_fallback_model: str | None = None,
     retrieval_profile_path: str | None = None,
 ) -> QueryUnderstanding:
     """Parse one retrieval query into a structured understanding object."""
+    config = get_demoindex_config()
     return _parse_query_internal(
         query,
-        use_llm=use_llm,
-        parse_model=parse_model,
-        parse_fallback_model=parse_fallback_model,
-        retrieval_profile_path=retrieval_profile_path,
+        use_llm=config.retrieval.use_llm_parse if use_llm is None else use_llm,
+        parse_model=parse_model or config.retrieval.parse_model,
+        parse_fallback_model=parse_fallback_model or config.retrieval.parse_fallback_model,
+        retrieval_profile_path=retrieval_profile_path or config.retrieval_profile_path,
         debug_recorder=None,
     )
 
@@ -514,46 +530,80 @@ def parse_query(
 def localize_sections(
     stage12_result: RetrievalStage12Result,
     *,
-    mode: Literal["heuristic", "hybrid"] = "hybrid",
+    mode: Literal["heuristic", "hybrid"] | None = None,
     top_k_docs: int | None = None,
-    top_k_anchor_sections_per_doc: int = 3,
-    top_k_tree_sections_per_doc: int = 5,
-    whole_doc_fallback: bool = True,
-    rerank_model: str = DEFAULT_PARSE_MODEL,
-    rerank_fallback_model: str = DEFAULT_PARSE_FALLBACK_MODEL,
-    stage3_shortlist_size: int = DEFAULT_STAGE3_SHORTLIST_SIZE,
+    top_k_anchor_sections_per_doc: int | None = None,
+    top_k_tree_sections_per_doc: int | None = None,
+    whole_doc_fallback: bool | None = None,
+    rerank_model: str | None = None,
+    rerank_fallback_model: str | None = None,
+    stage3_shortlist_size: int | None = None,
     stage3_relation_priors: dict[str, float] | None = None,
-    debug_log: bool = False,
+    debug_log: bool | None = None,
     debug_log_dir: str | None = None,
 ) -> RetrievalStage3Result:
     """Run Stage 3 tree localization over an existing Stage 1 + 2 result."""
-    debug_recorder = _create_debug_recorder(debug_log=debug_log, debug_log_dir=debug_log_dir)
+    config = get_demoindex_config()
+    resolved_mode = mode or config.retrieval.stage3_mode
+    resolved_top_k_anchor_sections_per_doc = (
+        config.retrieval.stage3_top_k_anchor_sections_per_doc
+        if top_k_anchor_sections_per_doc is None
+        else top_k_anchor_sections_per_doc
+    )
+    resolved_top_k_tree_sections_per_doc = (
+        config.retrieval.stage3_top_k_tree_sections_per_doc
+        if top_k_tree_sections_per_doc is None
+        else top_k_tree_sections_per_doc
+    )
+    resolved_whole_doc_fallback = (
+        config.retrieval.stage3_whole_doc_fallback
+        if whole_doc_fallback is None
+        else whole_doc_fallback
+    )
+    resolved_rerank_model = rerank_model or config.retrieval.stage3_rerank_model
+    resolved_rerank_fallback_model = (
+        rerank_fallback_model or config.retrieval.stage3_rerank_fallback_model
+    )
+    resolved_stage3_shortlist_size = (
+        config.retrieval.stage3_shortlist_size
+        if stage3_shortlist_size is None
+        else stage3_shortlist_size
+    )
+    resolved_stage3_relation_priors = _normalize_stage3_relation_priors(
+        stage3_relation_priors or config.retrieval.stage3_relation_priors
+    )
+    resolved_debug_log = config.debug_log if debug_log is None else debug_log
+    resolved_debug_log_dir = debug_log_dir or config.debug_log_dir
+    debug_recorder = _create_debug_recorder(
+        debug_log=resolved_debug_log,
+        debug_log_dir=resolved_debug_log_dir,
+    )
     started_at = time.perf_counter()
     if debug_recorder is not None:
         debug_recorder.set_run_metadata(
             stage="stage3_only",
-            mode=mode,
+            mode=resolved_mode,
             top_k_docs=top_k_docs,
-            top_k_anchor_sections_per_doc=top_k_anchor_sections_per_doc,
-            top_k_tree_sections_per_doc=top_k_tree_sections_per_doc,
-            whole_doc_fallback=whole_doc_fallback,
-            rerank_model=rerank_model,
-            rerank_fallback_model=rerank_fallback_model,
-            stage3_shortlist_size=stage3_shortlist_size,
-            stage3_relation_priors=stage3_relation_priors or STAGE3_RELATION_PRIOR,
+            top_k_anchor_sections_per_doc=resolved_top_k_anchor_sections_per_doc,
+            top_k_tree_sections_per_doc=resolved_top_k_tree_sections_per_doc,
+            whole_doc_fallback=resolved_whole_doc_fallback,
+            rerank_model=resolved_rerank_model,
+            rerank_fallback_model=resolved_rerank_fallback_model,
+            stage3_shortlist_size=resolved_stage3_shortlist_size,
+            stage3_relation_priors=resolved_stage3_relation_priors,
         )
     try:
         return _localize_sections_internal(
             stage12_result,
-            mode=mode,
+            mode=resolved_mode,
             top_k_docs=top_k_docs,
-            top_k_anchor_sections_per_doc=top_k_anchor_sections_per_doc,
-            top_k_tree_sections_per_doc=top_k_tree_sections_per_doc,
-            whole_doc_fallback=whole_doc_fallback,
-            rerank_model=rerank_model,
-            rerank_fallback_model=rerank_fallback_model,
-            stage3_shortlist_size=stage3_shortlist_size,
-            stage3_relation_priors=_normalize_stage3_relation_priors(stage3_relation_priors),
+            top_k_anchor_sections_per_doc=resolved_top_k_anchor_sections_per_doc,
+            top_k_tree_sections_per_doc=resolved_top_k_tree_sections_per_doc,
+            whole_doc_fallback=resolved_whole_doc_fallback,
+            rerank_model=resolved_rerank_model,
+            rerank_fallback_model=resolved_rerank_fallback_model,
+            stage3_shortlist_size=resolved_stage3_shortlist_size,
+            stage3_relation_priors=resolved_stage3_relation_priors,
             debug_recorder=debug_recorder,
         )
     finally:
@@ -564,64 +614,111 @@ def localize_sections(
 def retrieve_candidates(
     query: str,
     *,
-    top_k_dense: int = DEFAULT_TOP_K_DENSE,
-    top_k_lexical: int = DEFAULT_TOP_K_LEXICAL,
-    top_k_fused_chunks: int = DEFAULT_TOP_K_FUSED_CHUNKS,
-    top_k_docs: int = DEFAULT_TOP_K_DOCS,
-    top_k_sections_per_doc: int = DEFAULT_TOP_K_SECTIONS_PER_DOC,
-    top_k_chunks_per_section: int = DEFAULT_TOP_K_CHUNKS_PER_SECTION,
-    use_llm_parse: bool = True,
-    parse_model: str = DEFAULT_PARSE_MODEL,
-    parse_fallback_model: str = DEFAULT_PARSE_FALLBACK_MODEL,
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
-    rrf_k: int = DEFAULT_RRF_K,
-    lexical_score_threshold: float = LEXICAL_SCORE_THRESHOLD,
-    doc_score_chunk_limit: int = DEFAULT_DOC_SCORE_CHUNK_LIMIT,
-    section_score_chunk_limit: int = DEFAULT_SECTION_SCORE_CHUNK_LIMIT,
+    top_k_dense: int | None = None,
+    top_k_lexical: int | None = None,
+    top_k_fused_chunks: int | None = None,
+    top_k_docs: int | None = None,
+    top_k_sections_per_doc: int | None = None,
+    top_k_chunks_per_section: int | None = None,
+    use_llm_parse: bool | None = None,
+    parse_model: str | None = None,
+    parse_fallback_model: str | None = None,
+    embedding_model: str | None = None,
+    rrf_k: int | None = None,
+    lexical_score_threshold: float | None = None,
+    doc_score_chunk_limit: int | None = None,
+    section_score_chunk_limit: int | None = None,
     retrieval_profile_path: str | None = None,
-    debug_log: bool = False,
+    debug_log: bool | None = None,
     debug_log_dir: str | None = None,
 ) -> RetrievalStage12Result:
     """Run Stage 1 and Stage 2 retrieval and return a rich handoff object."""
-    debug_recorder = _create_debug_recorder(debug_log=debug_log, debug_log_dir=debug_log_dir)
+    config = get_demoindex_config()
+    resolved_top_k_dense = config.retrieval.top_k_dense if top_k_dense is None else top_k_dense
+    resolved_top_k_lexical = config.retrieval.top_k_lexical if top_k_lexical is None else top_k_lexical
+    resolved_top_k_fused_chunks = (
+        config.retrieval.top_k_fused_chunks if top_k_fused_chunks is None else top_k_fused_chunks
+    )
+    resolved_top_k_docs = config.retrieval.top_k_docs if top_k_docs is None else top_k_docs
+    resolved_top_k_sections_per_doc = (
+        config.retrieval.top_k_sections_per_doc
+        if top_k_sections_per_doc is None
+        else top_k_sections_per_doc
+    )
+    resolved_top_k_chunks_per_section = (
+        config.retrieval.top_k_chunks_per_section
+        if top_k_chunks_per_section is None
+        else top_k_chunks_per_section
+    )
+    resolved_use_llm_parse = (
+        config.retrieval.use_llm_parse if use_llm_parse is None else use_llm_parse
+    )
+    resolved_parse_model = parse_model or config.retrieval.parse_model
+    resolved_parse_fallback_model = (
+        parse_fallback_model or config.retrieval.parse_fallback_model
+    )
+    resolved_embedding_model = embedding_model or config.retrieval.embedding_model
+    resolved_rrf_k = config.retrieval.rrf_k if rrf_k is None else rrf_k
+    resolved_lexical_score_threshold = (
+        config.retrieval.lexical_score_threshold
+        if lexical_score_threshold is None
+        else lexical_score_threshold
+    )
+    resolved_doc_score_chunk_limit = (
+        config.retrieval.doc_score_chunk_limit
+        if doc_score_chunk_limit is None
+        else doc_score_chunk_limit
+    )
+    resolved_section_score_chunk_limit = (
+        config.retrieval.section_score_chunk_limit
+        if section_score_chunk_limit is None
+        else section_score_chunk_limit
+    )
+    resolved_retrieval_profile_path = retrieval_profile_path or config.retrieval_profile_path
+    resolved_debug_log = config.debug_log if debug_log is None else debug_log
+    resolved_debug_log_dir = debug_log_dir or config.debug_log_dir
+    debug_recorder = _create_debug_recorder(
+        debug_log=resolved_debug_log,
+        debug_log_dir=resolved_debug_log_dir,
+    )
     started_at = time.perf_counter()
     if debug_recorder is not None:
         debug_recorder.set_run_metadata(
             query=query,
-            top_k_dense=top_k_dense,
-            top_k_lexical=top_k_lexical,
-            top_k_fused_chunks=top_k_fused_chunks,
-            top_k_docs=top_k_docs,
-            top_k_sections_per_doc=top_k_sections_per_doc,
-            top_k_chunks_per_section=top_k_chunks_per_section,
-            use_llm_parse=use_llm_parse,
-            parse_model=parse_model,
-            parse_fallback_model=parse_fallback_model,
-            embedding_model=embedding_model,
-            rrf_k=rrf_k,
-            lexical_score_threshold=lexical_score_threshold,
-            doc_score_chunk_limit=doc_score_chunk_limit,
-            section_score_chunk_limit=section_score_chunk_limit,
-            retrieval_profile_path=retrieval_profile_path,
+            top_k_dense=resolved_top_k_dense,
+            top_k_lexical=resolved_top_k_lexical,
+            top_k_fused_chunks=resolved_top_k_fused_chunks,
+            top_k_docs=resolved_top_k_docs,
+            top_k_sections_per_doc=resolved_top_k_sections_per_doc,
+            top_k_chunks_per_section=resolved_top_k_chunks_per_section,
+            use_llm_parse=resolved_use_llm_parse,
+            parse_model=resolved_parse_model,
+            parse_fallback_model=resolved_parse_fallback_model,
+            embedding_model=resolved_embedding_model,
+            rrf_k=resolved_rrf_k,
+            lexical_score_threshold=resolved_lexical_score_threshold,
+            doc_score_chunk_limit=resolved_doc_score_chunk_limit,
+            section_score_chunk_limit=resolved_section_score_chunk_limit,
+            retrieval_profile_path=resolved_retrieval_profile_path,
         )
     try:
         return _retrieve_candidates_internal(
             query=query,
-            top_k_dense=top_k_dense,
-            top_k_lexical=top_k_lexical,
-            top_k_fused_chunks=top_k_fused_chunks,
-            top_k_docs=top_k_docs,
-            top_k_sections_per_doc=top_k_sections_per_doc,
-            top_k_chunks_per_section=top_k_chunks_per_section,
-            use_llm_parse=use_llm_parse,
-            parse_model=parse_model,
-            parse_fallback_model=parse_fallback_model,
-            embedding_model=embedding_model,
-            rrf_k=rrf_k,
-            lexical_score_threshold=lexical_score_threshold,
-            doc_score_chunk_limit=doc_score_chunk_limit,
-            section_score_chunk_limit=section_score_chunk_limit,
-            retrieval_profile_path=retrieval_profile_path,
+            top_k_dense=resolved_top_k_dense,
+            top_k_lexical=resolved_top_k_lexical,
+            top_k_fused_chunks=resolved_top_k_fused_chunks,
+            top_k_docs=resolved_top_k_docs,
+            top_k_sections_per_doc=resolved_top_k_sections_per_doc,
+            top_k_chunks_per_section=resolved_top_k_chunks_per_section,
+            use_llm_parse=resolved_use_llm_parse,
+            parse_model=resolved_parse_model,
+            parse_fallback_model=resolved_parse_fallback_model,
+            embedding_model=resolved_embedding_model,
+            rrf_k=resolved_rrf_k,
+            lexical_score_threshold=resolved_lexical_score_threshold,
+            doc_score_chunk_limit=resolved_doc_score_chunk_limit,
+            section_score_chunk_limit=resolved_section_score_chunk_limit,
+            retrieval_profile_path=resolved_retrieval_profile_path,
             debug_recorder=debug_recorder,
         )
     finally:
@@ -632,96 +729,171 @@ def retrieve_candidates(
 def retrieve_tree_candidates(
     query: str,
     *,
-    top_k_dense: int = DEFAULT_TOP_K_DENSE,
-    top_k_lexical: int = DEFAULT_TOP_K_LEXICAL,
-    top_k_fused_chunks: int = DEFAULT_TOP_K_FUSED_CHUNKS,
-    top_k_docs: int = DEFAULT_TOP_K_DOCS,
-    top_k_sections_per_doc: int = DEFAULT_TOP_K_SECTIONS_PER_DOC,
-    top_k_chunks_per_section: int = DEFAULT_TOP_K_CHUNKS_PER_SECTION,
-    use_llm_parse: bool = True,
-    parse_model: str = DEFAULT_PARSE_MODEL,
-    parse_fallback_model: str = DEFAULT_PARSE_FALLBACK_MODEL,
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
-    rrf_k: int = DEFAULT_RRF_K,
-    lexical_score_threshold: float = LEXICAL_SCORE_THRESHOLD,
-    doc_score_chunk_limit: int = DEFAULT_DOC_SCORE_CHUNK_LIMIT,
-    section_score_chunk_limit: int = DEFAULT_SECTION_SCORE_CHUNK_LIMIT,
+    top_k_dense: int | None = None,
+    top_k_lexical: int | None = None,
+    top_k_fused_chunks: int | None = None,
+    top_k_docs: int | None = None,
+    top_k_sections_per_doc: int | None = None,
+    top_k_chunks_per_section: int | None = None,
+    use_llm_parse: bool | None = None,
+    parse_model: str | None = None,
+    parse_fallback_model: str | None = None,
+    embedding_model: str | None = None,
+    rrf_k: int | None = None,
+    lexical_score_threshold: float | None = None,
+    doc_score_chunk_limit: int | None = None,
+    section_score_chunk_limit: int | None = None,
     retrieval_profile_path: str | None = None,
-    stage3_mode: Literal["heuristic", "hybrid"] = "hybrid",
-    top_k_tree_sections_per_doc: int = 5,
-    top_k_anchor_sections_per_doc: int = 3,
-    whole_doc_fallback: bool = True,
-    rerank_model: str = DEFAULT_PARSE_MODEL,
-    rerank_fallback_model: str = DEFAULT_PARSE_FALLBACK_MODEL,
-    stage3_shortlist_size: int = DEFAULT_STAGE3_SHORTLIST_SIZE,
+    stage3_mode: Literal["heuristic", "hybrid"] | None = None,
+    top_k_tree_sections_per_doc: int | None = None,
+    top_k_anchor_sections_per_doc: int | None = None,
+    whole_doc_fallback: bool | None = None,
+    rerank_model: str | None = None,
+    rerank_fallback_model: str | None = None,
+    stage3_shortlist_size: int | None = None,
     stage3_relation_priors: dict[str, float] | None = None,
-    debug_log: bool = False,
+    debug_log: bool | None = None,
     debug_log_dir: str | None = None,
 ) -> RetrievalStage3Result:
     """Run Stage 1 + Stage 2 + Stage 3 retrieval and return tree-localized sections."""
     if not str(query or "").strip():
         raise ValueError("Query must not be empty.")
 
-    debug_recorder = _create_debug_recorder(debug_log=debug_log, debug_log_dir=debug_log_dir)
+    config = get_demoindex_config()
+    resolved_top_k_dense = config.retrieval.top_k_dense if top_k_dense is None else top_k_dense
+    resolved_top_k_lexical = config.retrieval.top_k_lexical if top_k_lexical is None else top_k_lexical
+    resolved_top_k_fused_chunks = (
+        config.retrieval.top_k_fused_chunks if top_k_fused_chunks is None else top_k_fused_chunks
+    )
+    resolved_top_k_docs = config.retrieval.top_k_docs if top_k_docs is None else top_k_docs
+    resolved_top_k_sections_per_doc = (
+        config.retrieval.top_k_sections_per_doc
+        if top_k_sections_per_doc is None
+        else top_k_sections_per_doc
+    )
+    resolved_top_k_chunks_per_section = (
+        config.retrieval.top_k_chunks_per_section
+        if top_k_chunks_per_section is None
+        else top_k_chunks_per_section
+    )
+    resolved_use_llm_parse = (
+        config.retrieval.use_llm_parse if use_llm_parse is None else use_llm_parse
+    )
+    resolved_parse_model = parse_model or config.retrieval.parse_model
+    resolved_parse_fallback_model = (
+        parse_fallback_model or config.retrieval.parse_fallback_model
+    )
+    resolved_embedding_model = embedding_model or config.retrieval.embedding_model
+    resolved_rrf_k = config.retrieval.rrf_k if rrf_k is None else rrf_k
+    resolved_lexical_score_threshold = (
+        config.retrieval.lexical_score_threshold
+        if lexical_score_threshold is None
+        else lexical_score_threshold
+    )
+    resolved_doc_score_chunk_limit = (
+        config.retrieval.doc_score_chunk_limit
+        if doc_score_chunk_limit is None
+        else doc_score_chunk_limit
+    )
+    resolved_section_score_chunk_limit = (
+        config.retrieval.section_score_chunk_limit
+        if section_score_chunk_limit is None
+        else section_score_chunk_limit
+    )
+    resolved_retrieval_profile_path = retrieval_profile_path or config.retrieval_profile_path
+    resolved_stage3_mode = stage3_mode or config.retrieval.stage3_mode
+    resolved_top_k_tree_sections_per_doc = (
+        config.retrieval.stage3_top_k_tree_sections_per_doc
+        if top_k_tree_sections_per_doc is None
+        else top_k_tree_sections_per_doc
+    )
+    resolved_top_k_anchor_sections_per_doc = (
+        config.retrieval.stage3_top_k_anchor_sections_per_doc
+        if top_k_anchor_sections_per_doc is None
+        else top_k_anchor_sections_per_doc
+    )
+    resolved_whole_doc_fallback = (
+        config.retrieval.stage3_whole_doc_fallback
+        if whole_doc_fallback is None
+        else whole_doc_fallback
+    )
+    resolved_rerank_model = rerank_model or config.retrieval.stage3_rerank_model
+    resolved_rerank_fallback_model = (
+        rerank_fallback_model or config.retrieval.stage3_rerank_fallback_model
+    )
+    resolved_stage3_shortlist_size = (
+        config.retrieval.stage3_shortlist_size
+        if stage3_shortlist_size is None
+        else stage3_shortlist_size
+    )
+    resolved_stage3_relation_priors = _normalize_stage3_relation_priors(
+        stage3_relation_priors or config.retrieval.stage3_relation_priors
+    )
+    resolved_debug_log = config.debug_log if debug_log is None else debug_log
+    resolved_debug_log_dir = debug_log_dir or config.debug_log_dir
+    debug_recorder = _create_debug_recorder(
+        debug_log=resolved_debug_log,
+        debug_log_dir=resolved_debug_log_dir,
+    )
     started_at = time.perf_counter()
     if debug_recorder is not None:
         debug_recorder.set_run_metadata(
             query=query,
-            top_k_dense=top_k_dense,
-            top_k_lexical=top_k_lexical,
-            top_k_fused_chunks=top_k_fused_chunks,
-            top_k_docs=top_k_docs,
-            top_k_sections_per_doc=top_k_sections_per_doc,
-            top_k_chunks_per_section=top_k_chunks_per_section,
-            use_llm_parse=use_llm_parse,
-            parse_model=parse_model,
-            parse_fallback_model=parse_fallback_model,
-            embedding_model=embedding_model,
-            rrf_k=rrf_k,
-            lexical_score_threshold=lexical_score_threshold,
-            doc_score_chunk_limit=doc_score_chunk_limit,
-            section_score_chunk_limit=section_score_chunk_limit,
-            retrieval_profile_path=retrieval_profile_path,
-            stage3_mode=stage3_mode,
-            top_k_tree_sections_per_doc=top_k_tree_sections_per_doc,
-            top_k_anchor_sections_per_doc=top_k_anchor_sections_per_doc,
-            whole_doc_fallback=whole_doc_fallback,
-            rerank_model=rerank_model,
-            rerank_fallback_model=rerank_fallback_model,
-            stage3_shortlist_size=stage3_shortlist_size,
-            stage3_relation_priors=stage3_relation_priors or STAGE3_RELATION_PRIOR,
+            top_k_dense=resolved_top_k_dense,
+            top_k_lexical=resolved_top_k_lexical,
+            top_k_fused_chunks=resolved_top_k_fused_chunks,
+            top_k_docs=resolved_top_k_docs,
+            top_k_sections_per_doc=resolved_top_k_sections_per_doc,
+            top_k_chunks_per_section=resolved_top_k_chunks_per_section,
+            use_llm_parse=resolved_use_llm_parse,
+            parse_model=resolved_parse_model,
+            parse_fallback_model=resolved_parse_fallback_model,
+            embedding_model=resolved_embedding_model,
+            rrf_k=resolved_rrf_k,
+            lexical_score_threshold=resolved_lexical_score_threshold,
+            doc_score_chunk_limit=resolved_doc_score_chunk_limit,
+            section_score_chunk_limit=resolved_section_score_chunk_limit,
+            retrieval_profile_path=resolved_retrieval_profile_path,
+            stage3_mode=resolved_stage3_mode,
+            top_k_tree_sections_per_doc=resolved_top_k_tree_sections_per_doc,
+            top_k_anchor_sections_per_doc=resolved_top_k_anchor_sections_per_doc,
+            whole_doc_fallback=resolved_whole_doc_fallback,
+            rerank_model=resolved_rerank_model,
+            rerank_fallback_model=resolved_rerank_fallback_model,
+            stage3_shortlist_size=resolved_stage3_shortlist_size,
+            stage3_relation_priors=resolved_stage3_relation_priors,
         )
     try:
         stage12_result = _retrieve_candidates_internal(
             query=query,
-            top_k_dense=top_k_dense,
-            top_k_lexical=top_k_lexical,
-            top_k_fused_chunks=top_k_fused_chunks,
-            top_k_docs=top_k_docs,
-            top_k_sections_per_doc=top_k_sections_per_doc,
-            top_k_chunks_per_section=top_k_chunks_per_section,
-            use_llm_parse=use_llm_parse,
-            parse_model=parse_model,
-            parse_fallback_model=parse_fallback_model,
-            embedding_model=embedding_model,
-            rrf_k=rrf_k,
-            lexical_score_threshold=lexical_score_threshold,
-            doc_score_chunk_limit=doc_score_chunk_limit,
-            section_score_chunk_limit=section_score_chunk_limit,
-            retrieval_profile_path=retrieval_profile_path,
+            top_k_dense=resolved_top_k_dense,
+            top_k_lexical=resolved_top_k_lexical,
+            top_k_fused_chunks=resolved_top_k_fused_chunks,
+            top_k_docs=resolved_top_k_docs,
+            top_k_sections_per_doc=resolved_top_k_sections_per_doc,
+            top_k_chunks_per_section=resolved_top_k_chunks_per_section,
+            use_llm_parse=resolved_use_llm_parse,
+            parse_model=resolved_parse_model,
+            parse_fallback_model=resolved_parse_fallback_model,
+            embedding_model=resolved_embedding_model,
+            rrf_k=resolved_rrf_k,
+            lexical_score_threshold=resolved_lexical_score_threshold,
+            doc_score_chunk_limit=resolved_doc_score_chunk_limit,
+            section_score_chunk_limit=resolved_section_score_chunk_limit,
+            retrieval_profile_path=resolved_retrieval_profile_path,
             debug_recorder=debug_recorder,
         )
         return _localize_sections_internal(
             stage12_result,
-            mode=stage3_mode,
-            top_k_docs=top_k_docs,
-            top_k_anchor_sections_per_doc=top_k_anchor_sections_per_doc,
-            top_k_tree_sections_per_doc=top_k_tree_sections_per_doc,
-            whole_doc_fallback=whole_doc_fallback,
-            rerank_model=rerank_model,
-            rerank_fallback_model=rerank_fallback_model,
-            stage3_shortlist_size=stage3_shortlist_size,
-            stage3_relation_priors=_normalize_stage3_relation_priors(stage3_relation_priors),
+            mode=resolved_stage3_mode,
+            top_k_docs=resolved_top_k_docs,
+            top_k_anchor_sections_per_doc=resolved_top_k_anchor_sections_per_doc,
+            top_k_tree_sections_per_doc=resolved_top_k_tree_sections_per_doc,
+            whole_doc_fallback=resolved_whole_doc_fallback,
+            rerank_model=resolved_rerank_model,
+            rerank_fallback_model=resolved_rerank_fallback_model,
+            stage3_shortlist_size=resolved_stage3_shortlist_size,
+            stage3_relation_priors=resolved_stage3_relation_priors,
             debug_recorder=debug_recorder,
         )
     finally:
@@ -732,40 +904,81 @@ def retrieve_tree_candidates(
 def expand_localized_sections(
     stage3_result: RetrievalStage3Result,
     *,
-    top_k_focus_sections_per_doc: int = DEFAULT_TOP_K_FOCUS_SECTIONS_PER_DOC,
-    max_ancestor_hops: int = DEFAULT_MAX_ANCESTOR_HOPS,
-    max_descendant_depth: int = DEFAULT_MAX_DESCENDANT_DEPTH,
-    max_siblings_per_focus: int = DEFAULT_MAX_SIBLINGS_PER_FOCUS,
-    chunk_neighbor_window: int = DEFAULT_CHUNK_NEIGHBOR_WINDOW,
-    max_evidence_chunks_per_focus: int = DEFAULT_MAX_EVIDENCE_CHUNKS_PER_FOCUS,
-    context_char_budget: int = DEFAULT_CONTEXT_CHAR_BUDGET,
-    debug_log: bool = False,
+    top_k_focus_sections_per_doc: int | None = None,
+    max_ancestor_hops: int | None = None,
+    max_descendant_depth: int | None = None,
+    max_siblings_per_focus: int | None = None,
+    chunk_neighbor_window: int | None = None,
+    max_evidence_chunks_per_focus: int | None = None,
+    context_char_budget: int | None = None,
+    debug_log: bool | None = None,
     debug_log_dir: str | None = None,
 ) -> RetrievalStage4Result:
     """Run Stage 4 context expansion over an existing Stage 3 result."""
-    debug_recorder = _create_debug_recorder(debug_log=debug_log, debug_log_dir=debug_log_dir)
+    config = get_demoindex_config()
+    resolved_top_k_focus_sections_per_doc = (
+        config.retrieval.stage4_top_k_focus_sections_per_doc
+        if top_k_focus_sections_per_doc is None
+        else top_k_focus_sections_per_doc
+    )
+    resolved_max_ancestor_hops = (
+        config.retrieval.stage4_max_ancestor_hops
+        if max_ancestor_hops is None
+        else max_ancestor_hops
+    )
+    resolved_max_descendant_depth = (
+        config.retrieval.stage4_max_descendant_depth
+        if max_descendant_depth is None
+        else max_descendant_depth
+    )
+    resolved_max_siblings_per_focus = (
+        config.retrieval.stage4_max_siblings_per_focus
+        if max_siblings_per_focus is None
+        else max_siblings_per_focus
+    )
+    resolved_chunk_neighbor_window = (
+        config.retrieval.stage4_chunk_neighbor_window
+        if chunk_neighbor_window is None
+        else chunk_neighbor_window
+    )
+    resolved_max_evidence_chunks_per_focus = (
+        config.retrieval.stage4_max_evidence_chunks_per_focus
+        if max_evidence_chunks_per_focus is None
+        else max_evidence_chunks_per_focus
+    )
+    resolved_context_char_budget = (
+        config.retrieval.stage4_context_char_budget
+        if context_char_budget is None
+        else context_char_budget
+    )
+    resolved_debug_log = config.debug_log if debug_log is None else debug_log
+    resolved_debug_log_dir = debug_log_dir or config.debug_log_dir
+    debug_recorder = _create_debug_recorder(
+        debug_log=resolved_debug_log,
+        debug_log_dir=resolved_debug_log_dir,
+    )
     started_at = time.perf_counter()
     if debug_recorder is not None:
         debug_recorder.set_run_metadata(
             stage="stage4_only",
-            top_k_focus_sections_per_doc=top_k_focus_sections_per_doc,
-            max_ancestor_hops=max_ancestor_hops,
-            max_descendant_depth=max_descendant_depth,
-            max_siblings_per_focus=max_siblings_per_focus,
-            chunk_neighbor_window=chunk_neighbor_window,
-            max_evidence_chunks_per_focus=max_evidence_chunks_per_focus,
-            context_char_budget=context_char_budget,
+            top_k_focus_sections_per_doc=resolved_top_k_focus_sections_per_doc,
+            max_ancestor_hops=resolved_max_ancestor_hops,
+            max_descendant_depth=resolved_max_descendant_depth,
+            max_siblings_per_focus=resolved_max_siblings_per_focus,
+            chunk_neighbor_window=resolved_chunk_neighbor_window,
+            max_evidence_chunks_per_focus=resolved_max_evidence_chunks_per_focus,
+            context_char_budget=resolved_context_char_budget,
         )
     try:
         return _expand_localized_sections_internal(
             stage3_result,
-            top_k_focus_sections_per_doc=top_k_focus_sections_per_doc,
-            max_ancestor_hops=max_ancestor_hops,
-            max_descendant_depth=max_descendant_depth,
-            max_siblings_per_focus=max_siblings_per_focus,
-            chunk_neighbor_window=chunk_neighbor_window,
-            max_evidence_chunks_per_focus=max_evidence_chunks_per_focus,
-            context_char_budget=context_char_budget,
+            top_k_focus_sections_per_doc=resolved_top_k_focus_sections_per_doc,
+            max_ancestor_hops=resolved_max_ancestor_hops,
+            max_descendant_depth=resolved_max_descendant_depth,
+            max_siblings_per_focus=resolved_max_siblings_per_focus,
+            chunk_neighbor_window=resolved_chunk_neighbor_window,
+            max_evidence_chunks_per_focus=resolved_max_evidence_chunks_per_focus,
+            context_char_budget=resolved_context_char_budget,
             debug_recorder=debug_recorder,
         )
     finally:
@@ -776,37 +989,63 @@ def expand_localized_sections(
 def package_evidence(
     stage4_result: RetrievalStage4Result,
     *,
-    relation_mode: Literal["heuristic", "hybrid"] = DEFAULT_STAGE5_RELATION_MODE,
-    top_k_evidence_per_doc: int = DEFAULT_TOP_K_EVIDENCE_PER_DOC,
-    top_k_total_evidence: int = DEFAULT_TOP_K_TOTAL_EVIDENCE,
-    relation_model: str = DEFAULT_PARSE_MODEL,
-    relation_fallback_model: str = DEFAULT_PARSE_FALLBACK_MODEL,
-    relation_shortlist_size: int = DEFAULT_STAGE5_RELATION_SHORTLIST_SIZE,
-    debug_log: bool = False,
+    relation_mode: Literal["heuristic", "hybrid"] | None = None,
+    top_k_evidence_per_doc: int | None = None,
+    top_k_total_evidence: int | None = None,
+    relation_model: str | None = None,
+    relation_fallback_model: str | None = None,
+    relation_shortlist_size: int | None = None,
+    debug_log: bool | None = None,
     debug_log_dir: str | None = None,
 ) -> RetrievalStage5Result:
     """Run Stage 5 evidence packaging over an existing Stage 4 result."""
-    debug_recorder = _create_debug_recorder(debug_log=debug_log, debug_log_dir=debug_log_dir)
+    config = get_demoindex_config()
+    resolved_relation_mode = relation_mode or config.retrieval.stage5_relation_mode
+    resolved_top_k_evidence_per_doc = (
+        config.retrieval.stage5_top_k_evidence_per_doc
+        if top_k_evidence_per_doc is None
+        else top_k_evidence_per_doc
+    )
+    resolved_top_k_total_evidence = (
+        config.retrieval.stage5_top_k_total_evidence
+        if top_k_total_evidence is None
+        else top_k_total_evidence
+    )
+    resolved_relation_model = relation_model or config.retrieval.stage5_relation_model
+    resolved_relation_fallback_model = (
+        relation_fallback_model or config.retrieval.stage5_relation_fallback_model
+    )
+    resolved_relation_shortlist_size = (
+        config.retrieval.stage5_relation_shortlist_size
+        if relation_shortlist_size is None
+        else relation_shortlist_size
+    )
+    resolved_debug_log = config.debug_log if debug_log is None else debug_log
+    resolved_debug_log_dir = debug_log_dir or config.debug_log_dir
+    debug_recorder = _create_debug_recorder(
+        debug_log=resolved_debug_log,
+        debug_log_dir=resolved_debug_log_dir,
+    )
     started_at = time.perf_counter()
     if debug_recorder is not None:
         debug_recorder.set_run_metadata(
             stage="stage5_only",
-            relation_mode=relation_mode,
-            top_k_evidence_per_doc=top_k_evidence_per_doc,
-            top_k_total_evidence=top_k_total_evidence,
-            relation_model=relation_model,
-            relation_fallback_model=relation_fallback_model,
-            relation_shortlist_size=relation_shortlist_size,
+            relation_mode=resolved_relation_mode,
+            top_k_evidence_per_doc=resolved_top_k_evidence_per_doc,
+            top_k_total_evidence=resolved_top_k_total_evidence,
+            relation_model=resolved_relation_model,
+            relation_fallback_model=resolved_relation_fallback_model,
+            relation_shortlist_size=resolved_relation_shortlist_size,
         )
     try:
         return _package_evidence_internal(
             stage4_result,
-            relation_mode=relation_mode,
-            top_k_evidence_per_doc=top_k_evidence_per_doc,
-            top_k_total_evidence=top_k_total_evidence,
-            relation_model=relation_model,
-            relation_fallback_model=relation_fallback_model,
-            relation_shortlist_size=relation_shortlist_size,
+            relation_mode=resolved_relation_mode,
+            top_k_evidence_per_doc=resolved_top_k_evidence_per_doc,
+            top_k_total_evidence=resolved_top_k_total_evidence,
+            relation_model=resolved_relation_model,
+            relation_fallback_model=resolved_relation_fallback_model,
+            relation_shortlist_size=resolved_relation_shortlist_size,
             debug_recorder=debug_recorder,
         )
     finally:
@@ -817,143 +1056,275 @@ def package_evidence(
 def retrieve_evidence(
     query: str,
     *,
-    top_k_dense: int = DEFAULT_TOP_K_DENSE,
-    top_k_lexical: int = DEFAULT_TOP_K_LEXICAL,
-    top_k_fused_chunks: int = DEFAULT_TOP_K_FUSED_CHUNKS,
-    top_k_docs: int = DEFAULT_TOP_K_DOCS,
-    top_k_sections_per_doc: int = DEFAULT_TOP_K_SECTIONS_PER_DOC,
-    top_k_chunks_per_section: int = DEFAULT_TOP_K_CHUNKS_PER_SECTION,
-    use_llm_parse: bool = True,
-    parse_model: str = DEFAULT_PARSE_MODEL,
-    parse_fallback_model: str = DEFAULT_PARSE_FALLBACK_MODEL,
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
-    rrf_k: int = DEFAULT_RRF_K,
-    lexical_score_threshold: float = LEXICAL_SCORE_THRESHOLD,
-    doc_score_chunk_limit: int = DEFAULT_DOC_SCORE_CHUNK_LIMIT,
-    section_score_chunk_limit: int = DEFAULT_SECTION_SCORE_CHUNK_LIMIT,
+    top_k_dense: int | None = None,
+    top_k_lexical: int | None = None,
+    top_k_fused_chunks: int | None = None,
+    top_k_docs: int | None = None,
+    top_k_sections_per_doc: int | None = None,
+    top_k_chunks_per_section: int | None = None,
+    use_llm_parse: bool | None = None,
+    parse_model: str | None = None,
+    parse_fallback_model: str | None = None,
+    embedding_model: str | None = None,
+    rrf_k: int | None = None,
+    lexical_score_threshold: float | None = None,
+    doc_score_chunk_limit: int | None = None,
+    section_score_chunk_limit: int | None = None,
     retrieval_profile_path: str | None = None,
-    stage3_mode: Literal["heuristic", "hybrid"] = "hybrid",
-    top_k_tree_sections_per_doc: int = 5,
-    top_k_anchor_sections_per_doc: int = 3,
-    whole_doc_fallback: bool = True,
-    rerank_model: str = DEFAULT_PARSE_MODEL,
-    rerank_fallback_model: str = DEFAULT_PARSE_FALLBACK_MODEL,
-    stage3_shortlist_size: int = DEFAULT_STAGE3_SHORTLIST_SIZE,
+    stage3_mode: Literal["heuristic", "hybrid"] | None = None,
+    top_k_tree_sections_per_doc: int | None = None,
+    top_k_anchor_sections_per_doc: int | None = None,
+    whole_doc_fallback: bool | None = None,
+    rerank_model: str | None = None,
+    rerank_fallback_model: str | None = None,
+    stage3_shortlist_size: int | None = None,
     stage3_relation_priors: dict[str, float] | None = None,
-    top_k_focus_sections_per_doc: int = DEFAULT_TOP_K_FOCUS_SECTIONS_PER_DOC,
-    max_ancestor_hops: int = DEFAULT_MAX_ANCESTOR_HOPS,
-    max_descendant_depth: int = DEFAULT_MAX_DESCENDANT_DEPTH,
-    max_siblings_per_focus: int = DEFAULT_MAX_SIBLINGS_PER_FOCUS,
-    chunk_neighbor_window: int = DEFAULT_CHUNK_NEIGHBOR_WINDOW,
-    max_evidence_chunks_per_focus: int = DEFAULT_MAX_EVIDENCE_CHUNKS_PER_FOCUS,
-    context_char_budget: int = DEFAULT_CONTEXT_CHAR_BUDGET,
-    stage5_relation_mode: Literal["heuristic", "hybrid"] = DEFAULT_STAGE5_RELATION_MODE,
-    top_k_evidence_per_doc: int = DEFAULT_TOP_K_EVIDENCE_PER_DOC,
-    top_k_total_evidence: int = DEFAULT_TOP_K_TOTAL_EVIDENCE,
-    stage5_relation_model: str = DEFAULT_PARSE_MODEL,
-    stage5_relation_fallback_model: str = DEFAULT_PARSE_FALLBACK_MODEL,
-    stage5_relation_shortlist_size: int = DEFAULT_STAGE5_RELATION_SHORTLIST_SIZE,
-    debug_log: bool = False,
+    top_k_focus_sections_per_doc: int | None = None,
+    max_ancestor_hops: int | None = None,
+    max_descendant_depth: int | None = None,
+    max_siblings_per_focus: int | None = None,
+    chunk_neighbor_window: int | None = None,
+    max_evidence_chunks_per_focus: int | None = None,
+    context_char_budget: int | None = None,
+    stage5_relation_mode: Literal["heuristic", "hybrid"] | None = None,
+    top_k_evidence_per_doc: int | None = None,
+    top_k_total_evidence: int | None = None,
+    stage5_relation_model: str | None = None,
+    stage5_relation_fallback_model: str | None = None,
+    stage5_relation_shortlist_size: int | None = None,
+    debug_log: bool | None = None,
     debug_log_dir: str | None = None,
 ) -> RetrievalStage5Result:
     """Run Stage 1 through Stage 5 retrieval and return packaged evidence."""
     if not str(query or "").strip():
         raise ValueError("Query must not be empty.")
 
-    debug_recorder = _create_debug_recorder(debug_log=debug_log, debug_log_dir=debug_log_dir)
+    config = get_demoindex_config()
+    resolved_top_k_dense = config.retrieval.top_k_dense if top_k_dense is None else top_k_dense
+    resolved_top_k_lexical = config.retrieval.top_k_lexical if top_k_lexical is None else top_k_lexical
+    resolved_top_k_fused_chunks = (
+        config.retrieval.top_k_fused_chunks if top_k_fused_chunks is None else top_k_fused_chunks
+    )
+    resolved_top_k_docs = config.retrieval.top_k_docs if top_k_docs is None else top_k_docs
+    resolved_top_k_sections_per_doc = (
+        config.retrieval.top_k_sections_per_doc
+        if top_k_sections_per_doc is None
+        else top_k_sections_per_doc
+    )
+    resolved_top_k_chunks_per_section = (
+        config.retrieval.top_k_chunks_per_section
+        if top_k_chunks_per_section is None
+        else top_k_chunks_per_section
+    )
+    resolved_use_llm_parse = (
+        config.retrieval.use_llm_parse if use_llm_parse is None else use_llm_parse
+    )
+    resolved_parse_model = parse_model or config.retrieval.parse_model
+    resolved_parse_fallback_model = (
+        parse_fallback_model or config.retrieval.parse_fallback_model
+    )
+    resolved_embedding_model = embedding_model or config.retrieval.embedding_model
+    resolved_rrf_k = config.retrieval.rrf_k if rrf_k is None else rrf_k
+    resolved_lexical_score_threshold = (
+        config.retrieval.lexical_score_threshold
+        if lexical_score_threshold is None
+        else lexical_score_threshold
+    )
+    resolved_doc_score_chunk_limit = (
+        config.retrieval.doc_score_chunk_limit
+        if doc_score_chunk_limit is None
+        else doc_score_chunk_limit
+    )
+    resolved_section_score_chunk_limit = (
+        config.retrieval.section_score_chunk_limit
+        if section_score_chunk_limit is None
+        else section_score_chunk_limit
+    )
+    resolved_retrieval_profile_path = retrieval_profile_path or config.retrieval_profile_path
+    resolved_stage3_mode = stage3_mode or config.retrieval.stage3_mode
+    resolved_top_k_tree_sections_per_doc = (
+        config.retrieval.stage3_top_k_tree_sections_per_doc
+        if top_k_tree_sections_per_doc is None
+        else top_k_tree_sections_per_doc
+    )
+    resolved_top_k_anchor_sections_per_doc = (
+        config.retrieval.stage3_top_k_anchor_sections_per_doc
+        if top_k_anchor_sections_per_doc is None
+        else top_k_anchor_sections_per_doc
+    )
+    resolved_whole_doc_fallback = (
+        config.retrieval.stage3_whole_doc_fallback
+        if whole_doc_fallback is None
+        else whole_doc_fallback
+    )
+    resolved_rerank_model = rerank_model or config.retrieval.stage3_rerank_model
+    resolved_rerank_fallback_model = (
+        rerank_fallback_model or config.retrieval.stage3_rerank_fallback_model
+    )
+    resolved_stage3_shortlist_size = (
+        config.retrieval.stage3_shortlist_size
+        if stage3_shortlist_size is None
+        else stage3_shortlist_size
+    )
+    resolved_stage3_relation_priors = _normalize_stage3_relation_priors(
+        stage3_relation_priors or config.retrieval.stage3_relation_priors
+    )
+    resolved_top_k_focus_sections_per_doc = (
+        config.retrieval.stage4_top_k_focus_sections_per_doc
+        if top_k_focus_sections_per_doc is None
+        else top_k_focus_sections_per_doc
+    )
+    resolved_max_ancestor_hops = (
+        config.retrieval.stage4_max_ancestor_hops
+        if max_ancestor_hops is None
+        else max_ancestor_hops
+    )
+    resolved_max_descendant_depth = (
+        config.retrieval.stage4_max_descendant_depth
+        if max_descendant_depth is None
+        else max_descendant_depth
+    )
+    resolved_max_siblings_per_focus = (
+        config.retrieval.stage4_max_siblings_per_focus
+        if max_siblings_per_focus is None
+        else max_siblings_per_focus
+    )
+    resolved_chunk_neighbor_window = (
+        config.retrieval.stage4_chunk_neighbor_window
+        if chunk_neighbor_window is None
+        else chunk_neighbor_window
+    )
+    resolved_max_evidence_chunks_per_focus = (
+        config.retrieval.stage4_max_evidence_chunks_per_focus
+        if max_evidence_chunks_per_focus is None
+        else max_evidence_chunks_per_focus
+    )
+    resolved_context_char_budget = (
+        config.retrieval.stage4_context_char_budget
+        if context_char_budget is None
+        else context_char_budget
+    )
+    resolved_stage5_relation_mode = stage5_relation_mode or config.retrieval.stage5_relation_mode
+    resolved_top_k_evidence_per_doc = (
+        config.retrieval.stage5_top_k_evidence_per_doc
+        if top_k_evidence_per_doc is None
+        else top_k_evidence_per_doc
+    )
+    resolved_top_k_total_evidence = (
+        config.retrieval.stage5_top_k_total_evidence
+        if top_k_total_evidence is None
+        else top_k_total_evidence
+    )
+    resolved_stage5_relation_model = (
+        stage5_relation_model or config.retrieval.stage5_relation_model
+    )
+    resolved_stage5_relation_fallback_model = (
+        stage5_relation_fallback_model or config.retrieval.stage5_relation_fallback_model
+    )
+    resolved_stage5_relation_shortlist_size = (
+        config.retrieval.stage5_relation_shortlist_size
+        if stage5_relation_shortlist_size is None
+        else stage5_relation_shortlist_size
+    )
+    resolved_debug_log = config.debug_log if debug_log is None else debug_log
+    resolved_debug_log_dir = debug_log_dir or config.debug_log_dir
+    debug_recorder = _create_debug_recorder(
+        debug_log=resolved_debug_log,
+        debug_log_dir=resolved_debug_log_dir,
+    )
     started_at = time.perf_counter()
     if debug_recorder is not None:
         debug_recorder.set_run_metadata(
             query=query,
-            top_k_dense=top_k_dense,
-            top_k_lexical=top_k_lexical,
-            top_k_fused_chunks=top_k_fused_chunks,
-            top_k_docs=top_k_docs,
-            top_k_sections_per_doc=top_k_sections_per_doc,
-            top_k_chunks_per_section=top_k_chunks_per_section,
-            use_llm_parse=use_llm_parse,
-            parse_model=parse_model,
-            parse_fallback_model=parse_fallback_model,
-            embedding_model=embedding_model,
-            rrf_k=rrf_k,
-            lexical_score_threshold=lexical_score_threshold,
-            doc_score_chunk_limit=doc_score_chunk_limit,
-            section_score_chunk_limit=section_score_chunk_limit,
-            retrieval_profile_path=retrieval_profile_path,
-            stage3_mode=stage3_mode,
-            top_k_tree_sections_per_doc=top_k_tree_sections_per_doc,
-            top_k_anchor_sections_per_doc=top_k_anchor_sections_per_doc,
-            whole_doc_fallback=whole_doc_fallback,
-            rerank_model=rerank_model,
-            rerank_fallback_model=rerank_fallback_model,
-            stage3_shortlist_size=stage3_shortlist_size,
-            stage3_relation_priors=stage3_relation_priors or STAGE3_RELATION_PRIOR,
-            top_k_focus_sections_per_doc=top_k_focus_sections_per_doc,
-            max_ancestor_hops=max_ancestor_hops,
-            max_descendant_depth=max_descendant_depth,
-            max_siblings_per_focus=max_siblings_per_focus,
-            chunk_neighbor_window=chunk_neighbor_window,
-            max_evidence_chunks_per_focus=max_evidence_chunks_per_focus,
-            context_char_budget=context_char_budget,
-            stage5_relation_mode=stage5_relation_mode,
-            top_k_evidence_per_doc=top_k_evidence_per_doc,
-            top_k_total_evidence=top_k_total_evidence,
-            stage5_relation_model=stage5_relation_model,
-            stage5_relation_fallback_model=stage5_relation_fallback_model,
-            stage5_relation_shortlist_size=stage5_relation_shortlist_size,
+            top_k_dense=resolved_top_k_dense,
+            top_k_lexical=resolved_top_k_lexical,
+            top_k_fused_chunks=resolved_top_k_fused_chunks,
+            top_k_docs=resolved_top_k_docs,
+            top_k_sections_per_doc=resolved_top_k_sections_per_doc,
+            top_k_chunks_per_section=resolved_top_k_chunks_per_section,
+            use_llm_parse=resolved_use_llm_parse,
+            parse_model=resolved_parse_model,
+            parse_fallback_model=resolved_parse_fallback_model,
+            embedding_model=resolved_embedding_model,
+            rrf_k=resolved_rrf_k,
+            lexical_score_threshold=resolved_lexical_score_threshold,
+            doc_score_chunk_limit=resolved_doc_score_chunk_limit,
+            section_score_chunk_limit=resolved_section_score_chunk_limit,
+            retrieval_profile_path=resolved_retrieval_profile_path,
+            stage3_mode=resolved_stage3_mode,
+            top_k_tree_sections_per_doc=resolved_top_k_tree_sections_per_doc,
+            top_k_anchor_sections_per_doc=resolved_top_k_anchor_sections_per_doc,
+            whole_doc_fallback=resolved_whole_doc_fallback,
+            rerank_model=resolved_rerank_model,
+            rerank_fallback_model=resolved_rerank_fallback_model,
+            stage3_shortlist_size=resolved_stage3_shortlist_size,
+            stage3_relation_priors=resolved_stage3_relation_priors,
+            top_k_focus_sections_per_doc=resolved_top_k_focus_sections_per_doc,
+            max_ancestor_hops=resolved_max_ancestor_hops,
+            max_descendant_depth=resolved_max_descendant_depth,
+            max_siblings_per_focus=resolved_max_siblings_per_focus,
+            chunk_neighbor_window=resolved_chunk_neighbor_window,
+            max_evidence_chunks_per_focus=resolved_max_evidence_chunks_per_focus,
+            context_char_budget=resolved_context_char_budget,
+            stage5_relation_mode=resolved_stage5_relation_mode,
+            top_k_evidence_per_doc=resolved_top_k_evidence_per_doc,
+            top_k_total_evidence=resolved_top_k_total_evidence,
+            stage5_relation_model=resolved_stage5_relation_model,
+            stage5_relation_fallback_model=resolved_stage5_relation_fallback_model,
+            stage5_relation_shortlist_size=resolved_stage5_relation_shortlist_size,
         )
     try:
         stage12_result = _retrieve_candidates_internal(
             query=query,
-            top_k_dense=top_k_dense,
-            top_k_lexical=top_k_lexical,
-            top_k_fused_chunks=top_k_fused_chunks,
-            top_k_docs=top_k_docs,
-            top_k_sections_per_doc=top_k_sections_per_doc,
-            top_k_chunks_per_section=top_k_chunks_per_section,
-            use_llm_parse=use_llm_parse,
-            parse_model=parse_model,
-            parse_fallback_model=parse_fallback_model,
-            embedding_model=embedding_model,
-            rrf_k=rrf_k,
-            lexical_score_threshold=lexical_score_threshold,
-            doc_score_chunk_limit=doc_score_chunk_limit,
-            section_score_chunk_limit=section_score_chunk_limit,
-            retrieval_profile_path=retrieval_profile_path,
+            top_k_dense=resolved_top_k_dense,
+            top_k_lexical=resolved_top_k_lexical,
+            top_k_fused_chunks=resolved_top_k_fused_chunks,
+            top_k_docs=resolved_top_k_docs,
+            top_k_sections_per_doc=resolved_top_k_sections_per_doc,
+            top_k_chunks_per_section=resolved_top_k_chunks_per_section,
+            use_llm_parse=resolved_use_llm_parse,
+            parse_model=resolved_parse_model,
+            parse_fallback_model=resolved_parse_fallback_model,
+            embedding_model=resolved_embedding_model,
+            rrf_k=resolved_rrf_k,
+            lexical_score_threshold=resolved_lexical_score_threshold,
+            doc_score_chunk_limit=resolved_doc_score_chunk_limit,
+            section_score_chunk_limit=resolved_section_score_chunk_limit,
+            retrieval_profile_path=resolved_retrieval_profile_path,
             debug_recorder=debug_recorder,
         )
         stage3_result = _localize_sections_internal(
             stage12_result,
-            mode=stage3_mode,
-            top_k_docs=top_k_docs,
-            top_k_anchor_sections_per_doc=top_k_anchor_sections_per_doc,
-            top_k_tree_sections_per_doc=top_k_tree_sections_per_doc,
-            whole_doc_fallback=whole_doc_fallback,
-            rerank_model=rerank_model,
-            rerank_fallback_model=rerank_fallback_model,
-            stage3_shortlist_size=stage3_shortlist_size,
-            stage3_relation_priors=_normalize_stage3_relation_priors(stage3_relation_priors),
+            mode=resolved_stage3_mode,
+            top_k_docs=resolved_top_k_docs,
+            top_k_anchor_sections_per_doc=resolved_top_k_anchor_sections_per_doc,
+            top_k_tree_sections_per_doc=resolved_top_k_tree_sections_per_doc,
+            whole_doc_fallback=resolved_whole_doc_fallback,
+            rerank_model=resolved_rerank_model,
+            rerank_fallback_model=resolved_rerank_fallback_model,
+            stage3_shortlist_size=resolved_stage3_shortlist_size,
+            stage3_relation_priors=resolved_stage3_relation_priors,
             debug_recorder=debug_recorder,
         )
         stage4_result = _expand_localized_sections_internal(
             stage3_result,
-            top_k_focus_sections_per_doc=top_k_focus_sections_per_doc,
-            max_ancestor_hops=max_ancestor_hops,
-            max_descendant_depth=max_descendant_depth,
-            max_siblings_per_focus=max_siblings_per_focus,
-            chunk_neighbor_window=chunk_neighbor_window,
-            max_evidence_chunks_per_focus=max_evidence_chunks_per_focus,
-            context_char_budget=context_char_budget,
+            top_k_focus_sections_per_doc=resolved_top_k_focus_sections_per_doc,
+            max_ancestor_hops=resolved_max_ancestor_hops,
+            max_descendant_depth=resolved_max_descendant_depth,
+            max_siblings_per_focus=resolved_max_siblings_per_focus,
+            chunk_neighbor_window=resolved_chunk_neighbor_window,
+            max_evidence_chunks_per_focus=resolved_max_evidence_chunks_per_focus,
+            context_char_budget=resolved_context_char_budget,
             debug_recorder=debug_recorder,
         )
         return _package_evidence_internal(
             stage4_result,
-            relation_mode=stage5_relation_mode,
-            top_k_evidence_per_doc=top_k_evidence_per_doc,
-            top_k_total_evidence=top_k_total_evidence,
-            relation_model=stage5_relation_model,
-            relation_fallback_model=stage5_relation_fallback_model,
-            relation_shortlist_size=stage5_relation_shortlist_size,
+            relation_mode=resolved_stage5_relation_mode,
+            top_k_evidence_per_doc=resolved_top_k_evidence_per_doc,
+            top_k_total_evidence=resolved_top_k_total_evidence,
+            relation_model=resolved_stage5_relation_model,
+            relation_fallback_model=resolved_stage5_relation_fallback_model,
+            relation_shortlist_size=resolved_stage5_relation_shortlist_size,
             debug_recorder=debug_recorder,
         )
     finally:
@@ -1010,7 +1381,6 @@ def _retrieve_candidates_internal(
             debug_recorder,
         )
         with _debug_stage(debug_recorder, "dense_recall"):
-            load_dashscope_api_key()
             embedding_client = DashScopeEmbeddingClient(
                 model_name=embedding_model,
                 debug_recorder=debug_recorder,
@@ -1127,7 +1497,6 @@ def _localize_sections_internal(
         localized_sections: list[LocalizedSection] = []
         llm_client = None
         if mode == "hybrid":
-            load_dashscope_api_key()
             llm_client = QwenChatClient(
                 primary_model=rerank_model,
                 fallback_model=rerank_fallback_model,
@@ -1371,7 +1740,6 @@ def _package_evidence_internal(
         )
         labeled_items = evidence_items
         if relation_mode == "hybrid" and evidence_items:
-            load_dashscope_api_key()
             llm_client = QwenChatClient(
                 primary_model=relation_model,
                 fallback_model=relation_fallback_model,
@@ -2076,7 +2444,6 @@ def _parse_query_internal(
         return rule_result
 
     try:
-        load_dashscope_api_key()
         enriched = _enrich_query_with_llm(
             rule_result,
             parse_model=parse_model,
@@ -2904,7 +3271,7 @@ def _load_retrieval_profile_aliases(
     retrieval_profile_path: str | None,
 ) -> dict[str, dict[str, list[str]]]:
     """Load optional external alias mappings for query understanding."""
-    profile_path = retrieval_profile_path or os.getenv(DEFAULT_PROFILE_ENV_VAR)
+    profile_path = retrieval_profile_path or get_demoindex_config().retrieval_profile_path
     if not profile_path:
         if debug_recorder is not None:
             debug_recorder.log_event("retrieval_profile_loaded", enabled=False, path=None)

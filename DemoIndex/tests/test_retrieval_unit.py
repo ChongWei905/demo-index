@@ -6,8 +6,10 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+from DemoIndex import env as demo_env
 from DemoIndex.retrieval import (
     ContextChunk,
     ContextSection,
@@ -43,7 +45,12 @@ class RetrievalUnitTests(unittest.TestCase):
 
     def test_parse_query_rule_based_mixed_language(self) -> None:
         """Generic parsing should extract language, intent, terms, and time scope."""
-        result = parse_query("2024 全球手游 CPI 和 retention 趋势", use_llm=False)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                patch.object(demo_env, "DEMOINDEX_ENV_PATH", Path(tmp_dir) / ".env"),
+                patch.dict(os.environ, {}, clear=True),
+            ):
+                result = parse_query("2024 全球手游 CPI 和 retention 趋势", use_llm=False)
         self.assertEqual(result.language, "mixed")
         self.assertEqual(result.intent, "trend")
         self.assertIn("全球手游", result.terms)
@@ -55,8 +62,13 @@ class RetrievalUnitTests(unittest.TestCase):
 
     def test_parse_query_llm_failure_falls_back(self) -> None:
         """LLM enrichment errors should not break the rule-based parse."""
-        with patch("DemoIndex.retrieval._enrich_query_with_llm", side_effect=RuntimeError("boom")):
-            result = parse_query("留存率", use_llm=True)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                patch.object(demo_env, "DEMOINDEX_ENV_PATH", Path(tmp_dir) / ".env"),
+                patch.dict(os.environ, {}, clear=True),
+                patch("DemoIndex.retrieval._enrich_query_with_llm", side_effect=RuntimeError("boom")),
+            ):
+                result = parse_query("留存率", use_llm=True)
         self.assertEqual(result.intent, "general")
         self.assertEqual(result.terms, ["留存率", "留存", "存率"])
         self.assertEqual(result.metrics, [])
@@ -412,7 +424,6 @@ class RetrievalUnitTests(unittest.TestCase):
         with (
             patch("DemoIndex.retrieval._load_tree_sections_for_docs", return_value=(tree_sections, children_map)),
             patch("DemoIndex.retrieval.resolve_database_url", return_value="postgresql://unused"),
-            patch("DemoIndex.retrieval.load_dashscope_api_key"),
             patch("DemoIndex.retrieval.QwenChatClient") as mock_client_cls,
         ):
             mock_client_cls.return_value.completion.side_effect = RuntimeError("boom")

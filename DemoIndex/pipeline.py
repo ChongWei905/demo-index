@@ -10,13 +10,14 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
-
 from .build_md_pageindex import PageIndexOptions, sync_build_pageindex_payload
 from .debug import DebugRecorder
-from .env import PAGEINDEX_ROOT, REPO_ROOT, ensure_pageindex_import_path
+from .env import (
+    REPO_ROOT,
+    ensure_pageindex_import_path,
+    get_demoindex_config,
+)
 from .global_index import (
-    DEFAULT_GLOBAL_INDEX_MODEL,
     build_global_chunk_records,
 )
 from .llm import DashScopeEmbeddingClient, QwenChatClient
@@ -29,21 +30,37 @@ def build_pageindex_tree(
     pdf_path: str | None = None,
     output_json: str | None = None,
     artifacts_dir: str | None = None,
-    model: str = "dashscope/qwen3.6-plus",
-    fallback_model: str = "dashscope/qwen3.5-plus",
-    include_summary: bool = False,
-    write_postgres: bool = False,
-    write_global_index: bool = False,
-    global_index_model: str = DEFAULT_GLOBAL_INDEX_MODEL,
-    markdown_layout: str = "auto",
-    debug_log: bool = False,
+    model: str | None = None,
+    fallback_model: str | None = None,
+    include_summary: bool | None = None,
+    write_postgres: bool | None = None,
+    write_global_index: bool | None = None,
+    global_index_model: str | None = None,
+    markdown_layout: str | None = None,
+    debug_log: bool | None = None,
     debug_log_dir: str | None = None,
 ) -> dict[str, Any]:
     """Build a target-format tree from one PDF or Markdown input."""
     ensure_pageindex_import_path()
-    _load_pageindex_env()
-    effective_write_postgres = write_postgres or write_global_index
-    effective_include_summary = include_summary or effective_write_postgres
+    config = get_demoindex_config()
+    resolved_model = model or config.build.model
+    resolved_fallback_model = fallback_model or config.build.fallback_model
+    resolved_write_global_index = (
+        config.build.write_global_index if write_global_index is None else write_global_index
+    )
+    resolved_write_postgres = (
+        config.build.write_postgres if write_postgres is None else write_postgres
+    )
+    effective_write_postgres = resolved_write_postgres or resolved_write_global_index
+    resolved_include_summary = (
+        config.build.include_summary if include_summary is None else include_summary
+    )
+    effective_include_summary = resolved_include_summary or effective_write_postgres
+    resolved_global_index_model = global_index_model or config.build.global_index_model
+    resolved_markdown_layout = markdown_layout or config.build.markdown_layout
+    resolved_debug_log = config.debug_log if debug_log is None else debug_log
+    resolved_debug_log_dir = debug_log_dir or config.debug_log_dir
+    resolved_artifacts_dir = artifacts_dir or config.build.artifacts_dir
     if effective_write_postgres:
         resolve_database_url()
 
@@ -51,14 +68,18 @@ def build_pageindex_tree(
     input_kind = _detect_input_kind(resolved_input_path)
 
     artifact_root = (
-        Path(artifacts_dir).expanduser().resolve()
-        if artifacts_dir
+        Path(resolved_artifacts_dir).expanduser().resolve()
+        if resolved_artifacts_dir
         else REPO_ROOT / "DemoIndex" / "artifacts" / resolved_input_path.stem
     )
     artifact_root.mkdir(parents=True, exist_ok=True)
     debug_recorder = (
-        DebugRecorder(Path(debug_log_dir).expanduser().resolve() if debug_log_dir else artifact_root / "debug")
-        if debug_log
+        DebugRecorder(
+            Path(resolved_debug_log_dir).expanduser().resolve()
+            if resolved_debug_log_dir
+            else artifact_root / "debug"
+        )
+        if resolved_debug_log
         else None
     )
     if debug_recorder is not None:
@@ -67,13 +88,13 @@ def build_pageindex_tree(
             input_kind=input_kind,
             artifact_root=str(artifact_root),
             output_json=str(Path(output_json).expanduser().resolve()) if output_json else None,
-            model=model,
-            fallback_model=fallback_model,
+            model=resolved_model,
+            fallback_model=resolved_fallback_model,
             include_summary=effective_include_summary,
             write_postgres=effective_write_postgres,
-            write_global_index=write_global_index,
-            global_index_model=global_index_model,
-            markdown_layout=markdown_layout,
+            write_global_index=resolved_write_global_index,
+            global_index_model=resolved_global_index_model,
+            markdown_layout=resolved_markdown_layout,
         )
 
     target_output_path: Path | None = None
@@ -83,8 +104,8 @@ def build_pageindex_tree(
             output = _build_pdf_output(
                 resolved_input_path=resolved_input_path,
                 artifact_root=artifact_root,
-                model=model,
-                fallback_model=fallback_model,
+                model=resolved_model,
+                fallback_model=resolved_fallback_model,
                 include_summary=effective_include_summary,
                 debug_recorder=debug_recorder,
             )
@@ -92,28 +113,28 @@ def build_pageindex_tree(
             output = _build_markdown_output(
                 resolved_input_path=resolved_input_path,
                 artifact_root=artifact_root,
-                model=model,
-                fallback_model=fallback_model,
+                model=resolved_model,
+                fallback_model=resolved_fallback_model,
                 include_summary=effective_include_summary,
-                markdown_layout=markdown_layout,
+                markdown_layout=resolved_markdown_layout,
                 debug_recorder=debug_recorder,
             )
         if effective_write_postgres:
             with _debug_stage(debug_recorder, "persist_document_sections"):
                 persistence_report = persist_document_sections(output)
             _save_json(artifact_root / "postgres_write.json", persistence_report)
-        if write_global_index:
+        if resolved_write_global_index:
             utils_module = _load_pageindex_utils()
             with _debug_stage(debug_recorder, "build_global_chunk_records"):
                 embedding_client = DashScopeEmbeddingClient(
-                    model_name=global_index_model,
+                    model_name=resolved_global_index_model,
                     debug_recorder=debug_recorder,
                 )
                 chunk_records, chunk_report = build_global_chunk_records(
                     output,
                     count_tokens=utils_module.count_tokens,
                     embedding_client=embedding_client,
-                    embedding_model=global_index_model,
+                    embedding_model=resolved_global_index_model,
                 )
             with _debug_stage(debug_recorder, "persist_section_chunks"):
                 chunk_persistence_report = persist_section_chunks(
@@ -395,13 +416,6 @@ def compare_tree(actual_json: str, expected_json: str) -> dict[str, Any]:
     }
 
 
-def _load_pageindex_env() -> None:
-    """Load environment variables from PageIndex's local `.env` file."""
-    env_path = PAGEINDEX_ROOT / ".env"
-    if env_path.exists():
-        load_dotenv(env_path, override=False)
-
-
 def _patch_pageindex_llm(
     model: str,
     fallback_model: str | None,
@@ -412,13 +426,15 @@ def _patch_pageindex_llm(
 
     pageindex_module = importlib.import_module("pageindex.page_index")
     utils_module = importlib.import_module("pageindex.utils")
+    config = get_demoindex_config()
 
     client = QwenChatClient(
         primary_model=model,
         fallback_model=fallback_model,
-        timeout_seconds=min(120.0, float(utils_module._get_llm_timeout_seconds())),
-        max_retries=min(3, int(utils_module._get_llm_max_retries())),
-        max_concurrency=int(utils_module._get_llm_max_concurrency()),
+        timeout_seconds=config.llm.timeout_seconds,
+        max_retries=config.llm.max_retries,
+        retry_base_seconds=config.llm.retry_base_seconds,
+        max_concurrency=config.llm.max_concurrency,
         debug_recorder=debug_recorder,
     )
     utils_module.llm_completion = client.completion

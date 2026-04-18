@@ -378,28 +378,84 @@ DemoIndex/
 - PostgreSQL 16+
 - `pgvector`
 - `pg_trgm`
-- DashScope API key
+- 至少一套 chat API key
+- 至少一套 embedding API key
 
 当前 CLI 会在缺少依赖时自动尝试重进 `PageIndex/.venv`，所以在这个仓库里最省事的做法通常是直接复用：
 
 - `PageIndex/.venv`
 
-必需环境变量：
+## 配置入口
 
-- `DATABASE_URL`
-- `DASHSCOPE_API_KEY` 或兼容的 `OPENAI_API_KEY`
+DemoIndex 现在统一从下面两个文件理解运行配置：
 
-可选环境变量：
+- 主配置文件：`DemoIndex/.env`
+- 唯一模板来源：`DemoIndex/.env.example`
 
-- `DEMOINDEX_RETRIEVAL_PROFILE_PATH`
+推荐初始化方式：
+
+```bash
+cp /Users/weichong/Documents/new_working_area/file_tree/DemoIndex/.env.example \
+  /Users/weichong/Documents/new_working_area/file_tree/DemoIndex/.env
+```
+
+优先级固定为：
+
+- 显式 Python 参数 / CLI 参数
+- `DemoIndex/.env`
+- 代码默认值
+
+说明：
+
+- `input_path`、`query`、`output_json` 这类每次调用都变化的输入参数，不放进 env
+- DemoIndex 不再把 `PageIndex/.env` 作为主配置入口
+- 旧变量名如 `DASHSCOPE_API_KEY`、`OPENAI_API_KEY`、`PAGEINDEX_*`、`DATABASE_URL` 不再是 DemoIndex 的推荐配置方式，需要手动迁移到新的 `DEMOINDEX_*` 命名
+
+## Chat / Embedding API
+
+DemoIndex 现在把 chat 和 embedding API 完全拆开配置：
+
+- chat 读取 `DEMOINDEX_LLM_*`
+- embedding 读取 `DEMOINDEX_EMBEDDING_*`
+
+支持的 provider 固定为：
+
+- `dashscope`
+- `openai`
+
+常见组合：
+
+- chat 走 DashScope，embedding 走 OpenAI
+- chat 走 OpenAI，embedding 走 DashScope
+- 两边都走同一个 provider，但使用不同 key / base URL / model
+
+完整变量清单见：
+
+- `DemoIndex/.env.example`
+- `docs/retrieval_config.md`
 
 ## 快速开始
 
-### 1. 设置环境变量
+### 1. 准备 `DemoIndex/.env`
 
 ```bash
-export DATABASE_URL='postgresql://demoindex:demoindex@127.0.0.1:5432/demoindex'
-export DASHSCOPE_API_KEY='your-key'
+cp /Users/weichong/Documents/new_working_area/file_tree/DemoIndex/.env.example \
+  /Users/weichong/Documents/new_working_area/file_tree/DemoIndex/.env
+```
+
+最小可用示例：
+
+```dotenv
+DEMOINDEX_DATABASE_URL=postgresql://demoindex:demoindex@127.0.0.1:5432/demoindex
+
+DEMOINDEX_LLM_API_PROVIDER=dashscope
+DEMOINDEX_LLM_API_KEY=your-chat-key
+
+DEMOINDEX_EMBEDDING_API_PROVIDER=openai
+DEMOINDEX_EMBEDDING_API_KEY=your-embedding-key
+DEMOINDEX_RETRIEVAL_EMBEDDING_MODEL=text-embedding-3-large
+DEMOINDEX_BUILD_GLOBAL_INDEX_MODEL=text-embedding-3-large
+DEMOINDEX_EMBEDDING_DIMENSIONS=1024
 ```
 
 ### 2. 构建文档树与全局索引
@@ -428,7 +484,7 @@ Markdown 也走同一个入口：
 - `h1_forest`
 - `page_per_page`
 
-默认 `auto`，规则是：
+当 CLI 没显式传 `--markdown-layout` 时，会先读 `DEMOINDEX_BUILD_MARKDOWN_LAYOUT`，再回落代码默认值 `auto`。`auto` 的规则是：
 
 - 文件内存在 `<!-- page:N -->` 注释时，自动用 `page_per_page`
 - 否则使用 `h1_forest`
@@ -513,9 +569,15 @@ from DemoIndex import (
 - 跑完整 Stage 1~5：
   - `retrieve_evidence(...)`
 
+这些 Python API 现在和 CLI 一样遵守同一套优先级：
+
+- 显式函数参数
+- `DemoIndex/.env`
+- 代码默认值
+
 ## 配置项总览
 
-Stage 1~5 的全部检索配置已经统一整理到：
+Stage 1~5 的全部检索配置和 env 对照表已经统一整理到：
 
 - `docs/retrieval_config.md`
 
@@ -526,6 +588,10 @@ Stage 1~5 的全部检索配置已经统一整理到：
 - 想调树定位策略：看 Stage 3
 - 想调上下文范围：看 Stage 4
 - 想调证据输出规模与关系标注：看 Stage 5
+
+如果只想先看主模板，直接打开：
+
+- `DemoIndex/.env.example`
 
 ## 调试与埋点
 
