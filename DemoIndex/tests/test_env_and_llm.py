@@ -2,16 +2,34 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import DemoIndex.pipeline  # noqa: F401
 from DemoIndex import build_pageindex_tree, retrieve_candidates
 from DemoIndex import env as demo_env
-from DemoIndex.llm import DashScopeEmbeddingClient
+from DemoIndex.llm import DashScopeEmbeddingClient, QwenChatClient
 from DemoIndex.postgres_store import resolve_database_url
+
+
+def _load_dotenv_for_test(path: str | os.PathLike[str], override: bool = False) -> bool:
+    """Populate `os.environ` from one test `.env` file without relying on python-dotenv internals."""
+    env_path = Path(path)
+    if not env_path.exists():
+        return False
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        if override or key not in os.environ:
+            os.environ[key] = value
+    return True
 
 
 class _FakeEmbeddingsAPI:
@@ -46,6 +64,72 @@ class _FakeOpenAI:
         _FakeOpenAI.instances.append(self)
 
 
+class _FakeChatCompletionsAPI:
+    """Capture sync chat completion payloads and return one deterministic response."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        """Record the request payload and return one fake chat completion response."""
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"answer":"yes"}'),
+                    finish_reason="stop",
+                )
+            ],
+            model=kwargs["model"],
+            usage=SimpleNamespace(prompt_tokens=12, completion_tokens=4, total_tokens=16),
+        )
+
+
+class _FakeAsyncChatCompletionsAPI:
+    """Capture async chat completion payloads and return one deterministic response."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs):
+        """Record the async request payload and return one fake chat completion response."""
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"answer":"yes"}'),
+                    finish_reason="stop",
+                )
+            ],
+            model=kwargs["model"],
+            usage=SimpleNamespace(prompt_tokens=12, completion_tokens=4, total_tokens=16),
+        )
+
+
+class _FakeChatOpenAI:
+    """Minimal fake sync OpenAI client for chat tests."""
+
+    instances: list["_FakeChatOpenAI"] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.init_args = args
+        self.init_kwargs = kwargs
+        self.chat = SimpleNamespace(completions=_FakeChatCompletionsAPI())
+        _FakeChatOpenAI.instances.append(self)
+
+
+class _FakeAsyncOpenAI:
+    """Minimal fake async OpenAI client for chat tests."""
+
+    instances: list["_FakeAsyncOpenAI"] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.init_args = args
+        self.init_kwargs = kwargs
+        self.chat = SimpleNamespace(completions=_FakeAsyncChatCompletionsAPI())
+        _FakeAsyncOpenAI.instances.append(self)
+
+
 class EnvAndLLMTests(unittest.TestCase):
     """Cover env loading, precedence, and provider-specific embedding payloads."""
 
@@ -65,6 +149,7 @@ class EnvAndLLMTests(unittest.TestCase):
             )
             with (
                 patch.object(demo_env, "DEMOINDEX_ENV_PATH", env_path),
+                patch.object(demo_env, "load_dotenv", side_effect=_load_dotenv_for_test),
                 patch.dict("os.environ", {}, clear=True),
             ):
                 config = demo_env.get_demoindex_config()
@@ -82,6 +167,7 @@ class EnvAndLLMTests(unittest.TestCase):
             )
             with (
                 patch.object(demo_env, "DEMOINDEX_ENV_PATH", env_path),
+                patch.object(demo_env, "load_dotenv", side_effect=_load_dotenv_for_test),
                 patch.dict("os.environ", {}, clear=True),
             ):
                 config = demo_env.get_demoindex_config()
@@ -104,6 +190,7 @@ class EnvAndLLMTests(unittest.TestCase):
             )
             with (
                 patch.object(demo_env, "DEMOINDEX_ENV_PATH", env_path),
+                patch.object(demo_env, "load_dotenv", side_effect=_load_dotenv_for_test),
                 patch.dict("os.environ", {}, clear=True),
                 patch("DemoIndex.retrieval._retrieve_candidates_internal", return_value=sentinel) as mock_internal,
             ):
@@ -137,6 +224,7 @@ class EnvAndLLMTests(unittest.TestCase):
             )
             with (
                 patch.object(demo_env, "DEMOINDEX_ENV_PATH", env_path),
+                patch.object(demo_env, "load_dotenv", side_effect=_load_dotenv_for_test),
                 patch.dict("os.environ", {}, clear=True),
                 patch("DemoIndex.pipeline._build_markdown_output", return_value=expected_payload) as mock_builder,
             ):
@@ -157,6 +245,7 @@ class EnvAndLLMTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             with (
                 patch.object(demo_env, "DEMOINDEX_ENV_PATH", Path(tmp_dir) / ".env"),
+                patch.object(demo_env, "load_dotenv", side_effect=_load_dotenv_for_test),
                 patch.dict("os.environ", {}, clear=True),
             ):
                 with self.assertRaisesRegex(RuntimeError, "DEMOINDEX_DATABASE_URL"):
@@ -168,6 +257,7 @@ class EnvAndLLMTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             with (
                 patch.object(demo_env, "DEMOINDEX_ENV_PATH", Path(tmp_dir) / ".env"),
+                patch.object(demo_env, "load_dotenv", side_effect=_load_dotenv_for_test),
                 patch.dict(
                     "os.environ",
                     {
@@ -191,6 +281,7 @@ class EnvAndLLMTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             with (
                 patch.object(demo_env, "DEMOINDEX_ENV_PATH", Path(tmp_dir) / ".env"),
+                patch.object(demo_env, "load_dotenv", side_effect=_load_dotenv_for_test),
                 patch.dict(
                     "os.environ",
                     {
@@ -207,6 +298,68 @@ class EnvAndLLMTests(unittest.TestCase):
         self.assertEqual(len(vectors), 1)
         self.assertNotIn("extra_body", request)
         self.assertNotIn("dimensions", request)
+
+    def test_dashscope_chat_can_disable_thinking_and_strip_prompt_field(self) -> None:
+        """DashScope chat requests should disable thinking mode and remove prompt thinking fields."""
+        _FakeChatOpenAI.instances.clear()
+        _FakeAsyncOpenAI.instances.clear()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                patch.object(demo_env, "DEMOINDEX_ENV_PATH", Path(tmp_dir) / ".env"),
+                patch.object(demo_env, "load_dotenv", side_effect=_load_dotenv_for_test),
+                patch.dict(
+                    "os.environ",
+                    {
+                        "DEMOINDEX_LLM_API_PROVIDER": "dashscope",
+                        "DEMOINDEX_LLM_API_KEY": "dashscope-key",
+                    },
+                    clear=True,
+                ),
+                patch("DemoIndex.llm.OpenAI", _FakeChatOpenAI),
+                patch("DemoIndex.llm.AsyncOpenAI", _FakeAsyncOpenAI),
+            ):
+                client = QwenChatClient(enable_thinking=False, strip_thinking_field=True)
+                response = client.completion(
+                    model="dashscope/qwen3.6-plus",
+                    prompt='Reply format:\n{\n    "thinking": <why>\n    "answer": "yes"\n}',
+                )
+        request = _FakeChatOpenAI.instances[-1].chat.completions.calls[-1]
+        self.assertEqual(response, '{"answer":"yes"}')
+        self.assertEqual(request["extra_body"], {"enable_thinking": False})
+        self.assertNotIn('"thinking"', request["messages"][-1]["content"])
+        self.assertIn("Do not include any thinking field", request["messages"][-1]["content"])
+
+    def test_dashscope_async_chat_can_disable_thinking_and_strip_prompt_field(self) -> None:
+        """Async DashScope chat requests should use the same non-thinking request shaping."""
+        _FakeChatOpenAI.instances.clear()
+        _FakeAsyncOpenAI.instances.clear()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                patch.object(demo_env, "DEMOINDEX_ENV_PATH", Path(tmp_dir) / ".env"),
+                patch.object(demo_env, "load_dotenv", side_effect=_load_dotenv_for_test),
+                patch.dict(
+                    "os.environ",
+                    {
+                        "DEMOINDEX_LLM_API_PROVIDER": "dashscope",
+                        "DEMOINDEX_LLM_API_KEY": "dashscope-key",
+                    },
+                    clear=True,
+                ),
+                patch("DemoIndex.llm.OpenAI", _FakeChatOpenAI),
+                patch("DemoIndex.llm.AsyncOpenAI", _FakeAsyncOpenAI),
+            ):
+                client = QwenChatClient(enable_thinking=False, strip_thinking_field=True)
+                response = asyncio.run(
+                    client.acompletion(
+                        model="dashscope/qwen3.6-plus",
+                        prompt='Reply format:\n{\n    "thinking": <why>\n    "answer": "yes"\n}',
+                    )
+                )
+        request = _FakeAsyncOpenAI.instances[-1].chat.completions.calls[-1]
+        self.assertEqual(response, '{"answer":"yes"}')
+        self.assertEqual(request["extra_body"], {"enable_thinking": False})
+        self.assertNotIn('"thinking"', request["messages"][-1]["content"])
+        self.assertIn("Do not include any thinking field", request["messages"][-1]["content"])
 
 
 if __name__ == "__main__":

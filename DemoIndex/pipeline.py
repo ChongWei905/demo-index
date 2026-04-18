@@ -288,6 +288,8 @@ def _build_markdown_output(
             llm_factory=lambda: QwenChatClient(
                 primary_model=model,
                 fallback_model=fallback_model,
+                enable_thinking=False,
+                strip_thinking_field=True,
                 debug_recorder=debug_recorder,
             ),
             layout=resolved_layout,
@@ -435,6 +437,8 @@ def _patch_pageindex_llm(
         max_retries=config.llm.max_retries,
         retry_base_seconds=config.llm.retry_base_seconds,
         max_concurrency=config.llm.max_concurrency,
+        enable_thinking=False,
+        strip_thinking_field=True,
         debug_recorder=debug_recorder,
     )
     utils_module.llm_completion = client.completion

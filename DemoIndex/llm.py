@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any
 
@@ -20,6 +21,8 @@ from .env import (
 class QwenChatClient:
     """A provider-aware OpenAI-compatible wrapper for DemoIndex chat calls."""
 
+    _THINKING_FIELD_LINE_RE = re.compile(r'^[ \t]*"thinking"\s*:\s*.*(?:\n|$)', re.MULTILINE)
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -31,6 +34,8 @@ class QwenChatClient:
         max_retries: int | None = None,
         retry_base_seconds: float | None = None,
         max_concurrency: int | None = None,
+        enable_thinking: bool | None = None,
+        strip_thinking_field: bool = False,
         debug_recorder: Any | None = None,
     ) -> None:
         config = get_demoindex_config().llm
@@ -49,6 +54,8 @@ class QwenChatClient:
         self.max_retries = int(max_retries or config.max_retries)
         self.retry_base_seconds = float(retry_base_seconds or config.retry_base_seconds)
         self.max_concurrency = int(max_concurrency or config.max_concurrency)
+        self.enable_thinking = True if enable_thinking is None else bool(enable_thinking)
+        self.strip_thinking_field = bool(strip_thinking_field)
         self.primary_model = self._normalize_model_name(primary_model)
         self.fallback_model = self._normalize_model_name(fallback_model)
         self.debug_recorder = debug_recorder
@@ -109,6 +116,35 @@ class QwenChatClient:
             total += len(str(message.get("content") or ""))
         return total
 
+    @classmethod
+    def _sanitize_prompt_for_non_thinking_mode(cls, prompt: str) -> str:
+        """Remove prompt-level thinking fields when callers request terse JSON-only replies."""
+        cleaned = cls._THINKING_FIELD_LINE_RE.sub("", prompt)
+        if cleaned == prompt:
+            return prompt
+        return (
+            cleaned.rstrip()
+            + "\n\nDo not include any thinking field, explanation, or reasoning. "
+            "Return only the final requested JSON or text."
+        )
+
+    def _prepare_prompt(self, prompt: str) -> str:
+        """Apply provider-agnostic prompt cleanup before building chat messages."""
+        if not self.strip_thinking_field:
+            return prompt
+        return self._sanitize_prompt_for_non_thinking_mode(prompt)
+
+    def _build_chat_request(self, *, model: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        """Build one provider-aware chat completion request payload."""
+        request: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0,
+        }
+        if self.provider == "dashscope" and not self.enable_thinking:
+            request["extra_body"] = {"enable_thinking": False}
+        return request
+
     def _log_chat_call(
         self,
         *,
@@ -165,16 +201,14 @@ class QwenChatClient:
         model_candidates = [requested_model]
         if self.fallback_model and self.fallback_model not in model_candidates:
             model_candidates.append(self.fallback_model)
-        messages = self._build_messages(prompt, chat_history=chat_history)
+        messages = self._build_messages(self._prepare_prompt(prompt), chat_history=chat_history)
         last_error: Exception | None = None
         for candidate in model_candidates:
             for attempt in range(1, self.max_retries + 1):
                 start_time = time.time()
                 try:
                     response = self._client.chat.completions.create(
-                        model=candidate,
-                        messages=messages,
-                        temperature=0,
+                        **self._build_chat_request(model=candidate, messages=messages)
                     )
                     content = response.choices[0].message.content or ""
                     finish_reason = self._normalize_finish_reason(response.choices[0].finish_reason)
@@ -221,7 +255,7 @@ class QwenChatClient:
         model_candidates = [requested_model]
         if self.fallback_model and self.fallback_model not in model_candidates:
             model_candidates.append(self.fallback_model)
-        messages = self._build_messages(prompt)
+        messages = self._build_messages(self._prepare_prompt(prompt))
         last_error: Exception | None = None
         async with self._get_semaphore():
             for candidate in model_candidates:
@@ -229,9 +263,7 @@ class QwenChatClient:
                     start_time = time.time()
                     try:
                         response = await self._async_client.chat.completions.create(
-                            model=candidate,
-                            messages=messages,
-                            temperature=0,
+                            **self._build_chat_request(model=candidate, messages=messages)
                         )
                         content = response.choices[0].message.content or ""
                         finish_reason = self._normalize_finish_reason(response.choices[0].finish_reason)
