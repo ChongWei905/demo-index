@@ -134,6 +134,198 @@ def normalize_display_title(raw_title: str, level: int) -> str:
     return t
 
 
+def _normalize_title_for_matching(title: str) -> str:
+    """将标题文本规范化用于模糊匹配（去除空格、标点、全半角差异）。
+
+    入参:
+        title: 原始标题文本。
+
+    返回:
+        规范化后的小写字符串，用于匹配比较。
+    """
+    s = title.strip()
+    s = re.sub(r"\s+", "", s)
+    s = s.replace("：", ":").replace("；", ";").replace("，", ",").replace("。", ".")
+    s = s.replace("（", "(").replace("）", ")").replace("【", "[").replace("】", "]")
+    s = s.replace("—", "-").replace("–", "-").replace("…", "...")
+    s = s.replace(chr(0x201c), chr(34)).replace(chr(0x201d), chr(34)).replace(chr(0x2018), chr(39)).replace(chr(0x2019), chr(39))
+    return s.lower()
+
+
+def parse_toc_file(toc_path: str | Path) -> list[dict[str, Any]]:
+    """解析 TOC JSON 文件，返回 ``(title, level)`` 有序列表。
+
+    支持两种格式：嵌套树形（含 ``children`` 键）和扁平列表（含 ``level`` 键）。
+    自动检测：若首项含 ``children`` 键则按嵌套树形解析，否则按扁平列表解析。
+
+    入参:
+        toc_path: TOC JSON 文件路径。
+
+    返回:
+        有序字典列表，每项含 ``title``（str）和 ``level``（int）。
+
+    异常:
+        FileNotFoundError: 文件不存在。
+        ValueError: JSON 格式无效或内容为空。
+    """
+    path = Path(toc_path)
+    if not path.exists():
+        raise FileNotFoundError(f"TOC file not found: {path}")
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list) or not data:
+        raise ValueError("TOC file must contain a non-empty JSON array.")
+    if "children" in data[0]:
+        return _parse_toc_nested(data)
+    return _parse_toc_flat(data)
+
+
+def _parse_toc_nested(items: list[dict[str, Any]], depth: int = 1) -> list[dict[str, Any]]:
+    """递归解析嵌套树形 TOC 格式（内部）。
+
+    入参:
+        items: 当前层级的 TOC 条目列表。
+        depth: 当前嵌套深度（从 1 开始）。
+
+    返回:
+        有序字典列表，每项含 ``title`` 和 ``level``。
+    """
+    result: list[dict[str, Any]] = []
+    for item in items:
+        title = str(item.get("title", "")).strip()
+        if title:
+            result.append({"title": title, "level": depth})
+        children = item.get("children") or []
+        if children:
+            result.extend(_parse_toc_nested(children, depth + 1))
+    return result
+
+
+def _parse_toc_flat(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """解析扁平列表 TOC 格式（内部）。
+
+    入参:
+        items: TOC 条目列表，每项含 ``title`` 和 ``level``。
+
+    返回:
+        有序字典列表，每项含 ``title`` 和 ``level``。
+    """
+    result: list[dict[str, Any]] = []
+    for item in items:
+        title = str(item.get("title", "")).strip()
+        level = int(item.get("level", 1))
+        if title:
+            result.append({"title": title, "level": max(1, min(level, 6))})
+    return result
+
+
+def match_toc_to_headers(
+    toc_entries: list[dict[str, Any]],
+    headers: list[dict[str, Any]],
+) -> list[int | None]:
+    """将 TOC 条目与 MD 标题列表做模糊匹配，返回每个 MD 标题对应的 TOC level。
+
+    匹配规则（§3.2.B）：
+    1. 双方标题经 ``_normalize_title_for_matching`` 规范化后比较。
+    2. TOC 标题为 MD 标题的子串，或反之，均视为匹配。
+    3. 匹配优先级：精确匹配 > TOC 包含 MD > MD 包含 TOC。
+    4. 每个 TOC 条目最多匹配一个 MD 标题（贪心，按文档顺序）。
+
+    入参:
+        toc_entries: ``parse_toc_file`` 返回的 TOC 条目列表。
+        headers: ``iter_atx_headers`` 返回的标题列表。
+
+    返回:
+        与 ``headers`` 等长的列表；匹配成功时为 TOC level（int），未匹配为 None。
+    """
+    matched_toc_indices: set[int] = set()
+    result: list[int | None] = [None] * len(headers)
+
+    normalized_toc = [_normalize_title_for_matching(e["title"]) for e in toc_entries]
+    normalized_headers = [_normalize_title_for_matching(h["raw_title"]) for h in headers]
+
+    for h_idx, nh in enumerate(normalized_headers):
+        best_toc_idx: int | None = None
+        best_priority: int = -1
+        for t_idx, nt in enumerate(normalized_toc):
+            if t_idx in matched_toc_indices:
+                continue
+            if nh == nt:
+                priority = 3
+            elif nt and nh and nt in nh:
+                priority = 2
+            elif nt and nh and nh in nt:
+                priority = 1
+            else:
+                continue
+            if priority > best_priority:
+                best_priority = priority
+                best_toc_idx = t_idx
+        if best_toc_idx is not None:
+            matched_toc_indices.add(best_toc_idx)
+            result[h_idx] = toc_entries[best_toc_idx]["level"]
+
+    return result
+
+
+def _auto_normalize_levels(headers: list[dict[str, Any]]) -> None:
+    """自动层级规范化（§3.2.D）：消除跳跃，保证 level[i] <= max(level[0..i-1]) + 1。
+
+    额外规则：若规范化后所有 level 均 >= 2（无 H1），则整体减 1。
+
+    入参:
+        headers: 标题列表；原地修改 ``level`` 字段。
+
+    返回:
+        无（``None``）。
+    """
+    if not headers:
+        return
+    max_allowed = 1
+    for h in headers:
+        level = h["level"]
+        if level > max_allowed + 1:
+            level = max_allowed + 1
+        if level < 1:
+            level = 1
+        if level > 6:
+            level = 6
+        h["level"] = level
+        max_allowed = max(max_allowed, level)
+    if all(h["level"] >= 2 for h in headers):
+        for h in headers:
+            h["level"] -= 1
+
+
+def normalize_header_levels(
+    headers: list[dict[str, Any]],
+    *,
+    toc_entries: list[dict[str, Any]] | None = None,
+    normalize_levels: bool = True,
+) -> list[dict[str, Any]]:
+    """层级调整主入口（§3.2.C + §3.2.D）。
+
+    若提供 ``toc_entries`` 则先执行 TOC 驱动覆写；若 ``normalize_levels`` 为 True 则再执行
+    自动规范化。返回调整后的标题列表（原地修改 ``level`` 字段）。
+
+    入参:
+        headers: ``iter_atx_headers`` 返回的标题列表；原地修改。
+        toc_entries: ``parse_toc_file`` 返回的 TOC 条目列表；为 None 时跳过 TOC 覆写。
+        normalize_levels: 是否执行自动层级规范化（默认 True）。
+
+    返回:
+        调整后的标题列表（与输入为同一对象）。
+    """
+    if toc_entries:
+        toc_levels = match_toc_to_headers(toc_entries, headers)
+        for h_idx, toc_level in enumerate(toc_levels):
+            if toc_level is not None:
+                headers[h_idx]["level"] = toc_level
+    if normalize_levels:
+        _auto_normalize_levels(headers)
+    return headers
+
+
 def _join_lines(lines: list[str], start: int, end: int) -> str:
     """将 ``lines[start:end+1]`` 用换行拼接为一段文本，并去掉首尾多余换行。
 
@@ -290,12 +482,20 @@ def _merge_root_and_children(root: dict[str, Any], child_trees: list[dict[str, A
     return out
 
 
-def build_forest_from_markdown(lines: list[str], page_by_line: list[int]) -> list[dict[str, Any]]:
+def build_forest_from_markdown(
+    lines: list[str],
+    page_by_line: list[int],
+    *,
+    toc_entries: list[dict[str, Any]] | None = None,
+    normalize_levels: bool = True,
+) -> list[dict[str, Any]]:
     """根据全文行与页码映射，按每个 H1 切段并建树，得到多棵树的列表。
 
     入参:
         lines: 全文行列表。
         page_by_line: ``parse_page_comments`` 返回值。
+        toc_entries: ``parse_toc_file`` 返回的 TOC 条目列表；为 None 时跳过 TOC 覆写。
+        normalize_levels: 是否执行自动层级规范化（默认 True）。
 
     返回:
         森林：每个元素是一棵 H1 为根的树（含 ``_line_idx``、``title``、``page_index``、
@@ -305,6 +505,7 @@ def build_forest_from_markdown(lines: list[str], page_by_line: list[int]) -> lis
         ValueError: 文中没有 H1 标题时抛出。
     """
     all_h = iter_atx_headers(lines)
+    normalize_header_levels(all_h, toc_entries=toc_entries, normalize_levels=normalize_levels)
     h1s = find_h1_line_indices(all_h)
     if not h1s:
         raise ValueError("No H1 (#) headings found in markdown.")
@@ -381,7 +582,11 @@ def _page_node_title(
 
 
 def build_forest_page_per_page_with_doc_root(
-    lines: list[str], page_by_line: list[int]
+    lines: list[str],
+    page_by_line: list[int],
+    *,
+    toc_entries: list[dict[str, Any]] | None = None,
+    normalize_levels: bool = True,
 ) -> list[dict[str, Any]]:
     """页驱动布局：单文档根 + 每页一个子节点（整页 ``text``，子节点 ``nodes`` 为空列表）。
 
@@ -391,6 +596,8 @@ def build_forest_page_per_page_with_doc_root(
     入参:
         lines: 全文行列表。
         page_by_line: 与 ``lines`` 等长的页码列表，来自 ``parse_page_comments(lines)``。
+        toc_entries: ``parse_toc_file`` 返回的 TOC 条目列表；为 None 时跳过 TOC 覆写。
+        normalize_levels: 是否执行自动层级规范化（默认 True）。
 
     返回:
         长度为 1 的森林列表，元素为文档根字典（含 ``_line_idx``、``title``、``page_index``、
@@ -402,6 +609,7 @@ def build_forest_page_per_page_with_doc_root(
     if len(lines) != len(page_by_line):
         raise ValueError("lines and page_by_line must have the same length.")
     all_h = iter_atx_headers(lines)
+    normalize_header_levels(all_h, toc_entries=toc_entries, normalize_levels=normalize_levels)
     h1s = find_h1_line_indices(all_h)
 
     if h1s:
@@ -780,6 +988,8 @@ async def build_pageindex_payload(
     llm_factory: Callable[[], Any] | None = None,
     *,
     layout: PageIndexLayout = "h1_forest",
+    toc_file: str | Path | None = None,
+    normalize_levels: bool = True,
 ) -> dict[str, Any]:
     """从 Markdown 文件路径构建完整 API 载荷（含 ``doc_id``、``line_count``、``summary``、``result``）。
 
@@ -788,6 +998,8 @@ async def build_pageindex_payload(
         opt: 选项；默认 ``PageIndexOptions()``。
         llm_factory: 无参可调用，返回 LLM 客户端；为 None 或创建失败时摘要走启发式/空串。
         layout: ``h1_forest`` 按一级标题分段；``page_per_page`` 为文档根 + 每页一节点（§3.1）。
+        toc_file: TOC JSON 文件路径；为 None 时跳过 TOC 覆写。
+        normalize_levels: 是否执行自动层级规范化（默认 True）。
 
     返回:
         可 ``json.dumps`` 的字典，键含 ``doc_id``、``status``、``retrieval_ready``、
@@ -800,7 +1012,10 @@ async def build_pageindex_payload(
     line_count = compute_line_count(content)
     page_by_line = parse_page_comments(lines)
 
-    forest = _build_forest_for_layout(lines, page_by_line, layout)
+    toc_entries = parse_toc_file(toc_file) if toc_file else None
+    forest = _build_forest_for_layout(
+        lines, page_by_line, layout, toc_entries=toc_entries, normalize_levels=normalize_levels
+    )
     assign_node_ids_preorder(forest)
 
     needs_llm_page_title = bool(_collect_nodes_needing_llm_page_title(forest))
@@ -864,6 +1079,9 @@ def _build_forest_for_layout(
     lines: list[str],
     page_by_line: list[int],
     layout: PageIndexLayout,
+    *,
+    toc_entries: list[dict[str, Any]] | None = None,
+    normalize_levels: bool = True,
 ) -> list[dict[str, Any]]:
     """按布局枚举选择建树实现（内部）。
 
@@ -871,6 +1089,8 @@ def _build_forest_for_layout(
         lines: 全文行列表。
         page_by_line: ``parse_page_comments(lines)`` 的返回值。
         layout: ``h1_forest`` 或 ``page_per_page``。
+        toc_entries: ``parse_toc_file`` 返回的 TOC 条目列表。
+        normalize_levels: 是否执行自动层级规范化。
 
     返回:
         未分配 ``node_id`` 的树森林。
@@ -880,8 +1100,12 @@ def _build_forest_for_layout(
         ``build_forest_from_markdown`` 抛出。
     """
     if layout == "page_per_page":
-        return build_forest_page_per_page_with_doc_root(lines, page_by_line)
-    return build_forest_from_markdown(lines, page_by_line)
+        return build_forest_page_per_page_with_doc_root(
+            lines, page_by_line, toc_entries=toc_entries, normalize_levels=normalize_levels
+        )
+    return build_forest_from_markdown(
+        lines, page_by_line, toc_entries=toc_entries, normalize_levels=normalize_levels
+    )
 
 
 def _clear_summaries(n: dict[str, Any]) -> None:
@@ -904,6 +1128,8 @@ def sync_build_pageindex_payload(
     llm_factory: Callable[[], Any] | None = None,
     *,
     layout: PageIndexLayout = "h1_forest",
+    toc_file: str | Path | None = None,
+    normalize_levels: bool = True,
 ) -> dict[str, Any]:
     """``build_pageindex_payload`` 的同步包装，在内部 ``asyncio.run`` 一次。
 
@@ -912,11 +1138,18 @@ def sync_build_pageindex_payload(
         opt: 构建选项。
         llm_factory: LLM 工厂，语义同 ``build_pageindex_payload``。
         layout: 布局，语义同 ``build_pageindex_payload``。
+        toc_file: TOC JSON 文件路径；为 None 时跳过 TOC 覆写。
+        normalize_levels: 是否执行自动层级规范化（默认 True）。
 
     返回:
         与 ``build_pageindex_payload`` 相同的字典。
     """
-    return asyncio.run(build_pageindex_payload(md_path, opt, llm_factory, layout=layout))
+    return asyncio.run(
+        build_pageindex_payload(
+            md_path, opt, llm_factory, layout=layout, toc_file=toc_file,
+            normalize_levels=normalize_levels
+        )
+    )
 
 
 async def build_pageindex_payload_from_lines(
@@ -926,6 +1159,8 @@ async def build_pageindex_payload_from_lines(
     *,
     doc_id_seed: str | None = None,
     layout: PageIndexLayout = "h1_forest",
+    toc_entries: list[dict[str, Any]] | None = None,
+    normalize_levels: bool = True,
 ) -> dict[str, Any]:
     """从行列表构建完整 PageIndex API 载荷（无文件路径，便于管道内调用）。
 
@@ -935,6 +1170,8 @@ async def build_pageindex_payload_from_lines(
         llm_factory: 无参可调用，返回 LLM 客户端；为 None 或创建失败时摘要走启发式。
         doc_id_seed: 当 ``opt.doc_id`` 为 None 时，参与 UUID5 的种子（默认取内容前 8000 字符）。
         layout: ``h1_forest`` 或 ``page_per_page``。
+        toc_entries: ``parse_toc_file`` 返回的 TOC 条目列表；为 None 时跳过 TOC 覆写。
+        normalize_levels: 是否执行自动层级规范化（默认 True）。
 
     返回:
         与 ``build_pageindex_payload`` 相同结构的字典。
@@ -948,7 +1185,9 @@ async def build_pageindex_payload_from_lines(
         content += "\n"
     line_count = compute_line_count(content)
     page_by_line = parse_page_comments(lines)
-    forest = _build_forest_for_layout(lines, page_by_line, layout)
+    forest = _build_forest_for_layout(
+        lines, page_by_line, layout, toc_entries=toc_entries, normalize_levels=normalize_levels
+    )
     assign_node_ids_preorder(forest)
 
     needs_llm_page_title = bool(_collect_nodes_needing_llm_page_title(forest))
@@ -1016,6 +1255,8 @@ def sync_build_pageindex_payload_from_lines(
     *,
     doc_id_seed: str | None = None,
     layout: PageIndexLayout = "h1_forest",
+    toc_entries: list[dict[str, Any]] | None = None,
+    normalize_levels: bool = True,
 ) -> dict[str, Any]:
     """``build_pageindex_payload_from_lines`` 的同步包装（内部 ``asyncio.run`` 一次）。
 
@@ -1025,13 +1266,16 @@ def sync_build_pageindex_payload_from_lines(
         llm_factory: LLM 工厂。
         doc_id_seed: 确定性 ``doc_id`` 种子。
         layout: 布局，语义同 ``build_pageindex_payload_from_lines``。
+        toc_entries: ``parse_toc_file`` 返回的 TOC 条目列表。
+        normalize_levels: 是否执行自动层级规范化。
 
     返回:
         与 ``build_pageindex_payload_from_lines`` 相同的字典。
     """
     return asyncio.run(
         build_pageindex_payload_from_lines(
-            lines, opt, llm_factory, doc_id_seed=doc_id_seed, layout=layout
+            lines, opt, llm_factory, doc_id_seed=doc_id_seed, layout=layout,
+            toc_entries=toc_entries, normalize_levels=normalize_levels
         )
     )
 
@@ -1080,6 +1324,18 @@ def main_argv(argv: list[str] | None = None) -> None:
         choices=("h1-forest", "page-per-page"),
         help="h1-forest：按一级标题分段；page-per-page：文档根 + 每逻辑页一节点（含 MinerU 导出稿）",
     )
+    parser.add_argument(
+        "--toc-file",
+        type=str,
+        default=None,
+        help="TOC JSON 文件路径（嵌套树形或扁平列表格式），用于覆写标题层级",
+    )
+    parser.add_argument(
+        "--no-level-normalize",
+        action="store_true",
+        default=False,
+        help="跳过自动层级规范化（默认会自动消除标题层级跳跃）",
+    )
     args = parser.parse_args(argv)
 
     base = Path(__file__).resolve().parent
@@ -1117,7 +1373,10 @@ def main_argv(argv: list[str] | None = None) -> None:
         page_title_llm_max_chars=args.page_title_max_chars,
     )
 
-    payload = sync_build_pageindex_payload(md_path, opt, llm_factory=llm_factory, layout=layout_kw)
+    payload = sync_build_pageindex_payload(
+        md_path, opt, llm_factory=llm_factory, layout=layout_kw,
+        toc_file=args.toc_file, normalize_levels=not args.no_level_normalize
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Wrote {out_path}")

@@ -142,6 +142,138 @@
 
 ---
 
+## 3.2 标题层级调整（TOC 驱动 + 自动规范化）
+
+当 Markdown 原文的 ATX 标题层级不规范时（如 VLM 输出中 `#` 后直接跳 `###`，或所有标题均为 `##` 导致层级扁平），需要在建树之前对标题层级进行修正。本节描述两种互补的层级调整机制。
+
+### A. 动机
+
+1. **VLM / OCR 导出的 Markdown**：标题层级可能不准确，例如所有章节标题都被标记为 `##`，或深层标题跳过了中间层级（`#` → `###` 跳过 `##`）。
+2. **人工编写的 Markdown**：也可能存在层级跳跃或不一致。
+3. **PDF 建树流程已有 TOC 校正**（`_effective_outline_level`），但 Markdown 建树流程缺少对应能力。
+
+### B. 外部 TOC 文件格式
+
+用户可通过 **`--toc-file <path>`**（CLI）或 **`toc_file`**（API 参数）传入一个 JSON 文件，提供文档的目录结构。支持以下两种格式：
+
+#### 格式一：嵌套树形（推荐）
+
+```json
+[
+  {
+    "title": "第一章 概述",
+    "children": [
+      { "title": "1.1 背景", "children": [] },
+      { "title": "1.2 方法", "children": [] }
+    ]
+  },
+  {
+    "title": "第二章 分析",
+    "children": [
+      { "title": "2.1 数据", "children": [] }
+    ]
+  }
+]
+```
+
+层级由嵌套深度决定：根数组中的项为 level 1，其 `children` 为 level 2，以此类推。
+
+#### 格式二：扁平列表
+
+```json
+[
+  { "title": "第一章 概述", "level": 1 },
+  { "title": "1.1 背景", "level": 2 },
+  { "title": "1.2 方法", "level": 2 },
+  { "title": "第二章 分析", "level": 1 },
+  { "title": "2.1 数据", "level": 2 }
+]
+```
+
+每项显式标注 `level`。两种格式可自动检测：若首项含 `children` 键则按格式一解析，否则按格式二。
+
+#### TOC 条目匹配规则
+
+TOC 条目与 Markdown ATX 标题的匹配采用**模糊匹配**：
+
+1. 双方标题文本经 `_normalize_title_for_matching`（去除空格、标点、全半角差异）后比较。
+2. TOC 条目 `title` 为 Markdown 标题的**子串**，或反之，均视为匹配。
+3. 匹配优先级：精确匹配 > TOC 标题包含 MD 标题 > MD 标题包含 TOC 标题。
+4. 每个 TOC 条目最多匹配一个 MD 标题（贪心，按文档顺序）。
+
+### C. TOC 驱动的层级调整算法
+
+当提供了 TOC 文件时：
+
+1. 解析 TOC 文件，得到 `(title, toc_level)` 的有序列表。
+2. 扫描 Markdown 的 ATX 标题列表（`iter_atx_headers` 的返回值）。
+3. 对每个 MD 标题，尝试在 TOC 中找到匹配项：
+   - **匹配成功**：将该 MD 标题的 `level` 覆写为 TOC 中的 `toc_level`。
+   - **匹配失败**：保留原始 `level`，但后续仍参与自动规范化（§3.2.D）。
+4. 匹配结果记录到调试日志中，便于用户排查匹配遗漏。
+
+**边界情况**：
+
+- TOC 中的条目多于 MD 标题：多余的 TOC 条目被忽略（MD 中无对应标题）。
+- MD 标题多于 TOC 条目：未匹配的 MD 标题保留原始 level。
+- TOC 中同一层级出现多次同名标题：按文档顺序依次匹配。
+
+### D. 自动层级规范化（无 TOC 或 TOC 匹配后）
+
+无论是否提供了 TOC，在层级调整后都需要执行规范化，消除层级跳跃。算法如下：
+
+1. 将所有标题按文档顺序排列，提取其 `level` 序列，例如 `[1, 3, 3, 5, 2, 4]`。
+2. 从左到右扫描，维护一个「当前期望最大层级」`max_allowed`（初始为 1）：
+   - 第一个标题的 `level` 被规范化为 `min(level, max_allowed)`，即至少为 1。
+   - 后续标题：若 `level > max_allowed + 1`，则将其降为 `max_allowed + 1`；否则保留原值。
+   - 每处理一个标题后，更新 `max_allowed = max(max_allowed, normalized_level)`。
+3. 上述步骤保证：**任何标题的层级最多比前一个已处理标题的层级深 1 级**，消除跳跃。
+
+示例：
+
+| 原始 level | 规范化后 | 说明 |
+|---|---|---|
+| `[1, 3, 3, 5, 2, 4]` | `[1, 2, 3, 4, 2, 4]` | 3→2（跳级修正），5→4（跳级修正）；h[2] 的 3 ≤ max_allowed(2)+1=3 故保留 |
+| `[2, 2, 2]` | `[1, 1, 1]` | 无 H1 时全部提升为 1 |
+| `[1, 2, 3, 2, 3]` | `[1, 2, 3, 2, 3]` | 无跳跃，不变 |
+
+**额外规则**：
+
+- 若规范化后所有标题的 level 均 ≥ 2（即无 H1），则将所有 level 减 1，确保至少存在一个顶层节点。
+- 规范化后的 level 上限为 6（与 ATX 标题 `######` 一致），超出部分截断为 6。
+
+### E. 与现有流程的集成
+
+层级调整发生在 `iter_atx_headers()` 之后、`build_section_root_and_flat_nodes()` 之前：
+
+```
+iter_atx_headers()           → 原始标题列表（含原始 level）
+    ↓
+normalize_header_levels()    → 层级调整（TOC 驱动 + 自动规范化）
+    ↓
+build_section_root_and_flat_nodes()  → 使用调整后的 level 建树
+    ↓
+build_tree_from_flat_nodes() → 栈式建树
+```
+
+**对 `page_per_page` 布局的影响**：页驱动布局下，层级调整仅影响页内子树（`--page-subtrees` 开启时）的构建；页节点的 `title` 仍按 §3.1.A 规则确定，不受层级调整影响。
+
+### F. CLI 与 API 参数
+
+| 参数 | CLI | API | 默认值 | 说明 |
+|---|---|---|---|---|
+| TOC 文件 | `--toc-file <path>` | `toc_file: str \| None` | `None` | TOC JSON 文件路径；不提供则仅执行自动规范化 |
+| 跳过自动规范化 | `--no-level-normalize` | `normalize_levels: bool` | `True` | 设为 False 时跳过 §3.2.D 的自动规范化；仅在提供了 TOC 且信任其层级时使用 |
+
+### G. 测试约定
+
+- **TOC 驱动**：提供已知 TOC JSON + 含不规范层级的 Markdown fixture，断言调整后 level 与 TOC 层级一致。
+- **自动规范化**：提供含跳跃的 Markdown fixture，断言规范化后无 `level[i] > level[i-1] + 1` 的情况。
+- **混合场景**：部分标题匹配 TOC、部分不匹配，断言匹配部分使用 TOC 层级，未匹配部分经规范化补齐。
+- **边界**：空 TOC、所有标题均不匹配、所有标题均匹配、单标题文档。
+
+---
+
 ## 4. `summary` 与 `line_count` 的生成约定
 
 ### 4.1 `line_count`（顶层）
@@ -184,6 +316,11 @@
 | `iter_atx_headers(lines)` | 扫描 `#`～`######`，跳过 fenced 代码块。 |
 | `find_h1_line_indices(headers)` | 取出全部一级标题行号。 |
 | `normalize_display_title(raw_title, level)` | 生成对外 `title`（如前言前缀、`2025 年` 空格规则）。 |
+| **`parse_toc_file(toc_path)`** | **解析 TOC JSON 文件，返回 `(title, level)` 有序列表；自动检测嵌套树形 / 扁平列表格式（§3.2.B）。** |
+| **`match_toc_to_headers(toc_entries, headers)`** | **将 TOC 条目与 MD 标题列表做模糊匹配，返回每个 MD 标题对应的 TOC level（未匹配为 `None`）；匹配规则见 §3.2.B。** |
+| **`_normalize_title_for_matching(title)`** | **（内部）将标题文本规范化用于模糊匹配：去除空格、标点、全半角差异。** |
+| **`normalize_header_levels(headers, *, toc_entries=None, normalize_levels=True)`** | **层级调整主入口（§3.2.C + §3.2.D）：若提供 `toc_entries` 则先执行 TOC 驱动覆写；若 `normalize_levels=True` 则再执行自动规范化。返回调整后的标题列表（原地修改 `level` 字段）。** |
+| **`_auto_normalize_levels(headers)`** | **（内部）自动层级规范化（§3.2.D）：消除跳跃，保证 `level[i] ≤ max(level[0..i-1]) + 1`；无 H1 时整体提升。** |
 | `build_section_root_and_flat_nodes(...)` | 单个 H1 段：根节点 `text`（至段内首 `##` 前）+ 段内 `##+` 扁平列表。 |
 | `build_tree_from_flat_nodes(flat)` | 将扁平 `##+` 节点栈式挂成子树。 |
 | `build_forest_from_markdown(lines, page_by_line)` | **`layout=h1_forest`**：按每个 H1 切段建树，返回森林。 |
@@ -193,10 +330,10 @@
 | `compute_line_count(content)` | 计算顶层 `line_count`。 |
 | `async generate_doc_summary(...)` | 生成顶层文档 `summary`（LLM 或启发式）。 |
 | `async generate_node_summaries(...)` | 为每个节点填 `summary`（可批量异步）。 |
-| `async build_pageindex_payload(md_path, opt, llm_factory, *, layout=...)` | 从文件路径编排全流程；**`layout`**：`h1_forest`（默认）或 `page_per_page`。 |
-| `sync_build_pageindex_payload(..., *, layout=...)` | 上式的 `asyncio.run` 包装。 |
-| `async build_pageindex_payload_from_lines(lines, opt, llm_factory, *, doc_id_seed=..., layout=...)` | 与上等价，输入为行列表（无文件路径）。 |
-| `sync_build_pageindex_payload_from_lines(..., *, layout=...)` | 上式的同步包装。 |
+| `async build_pageindex_payload(md_path, opt, llm_factory, *, layout=..., toc_file=..., normalize_levels=...)` | 从文件路径编排全流程；**`layout`**：`h1_forest`（默认）或 `page_per_page`；**`toc_file`**：TOC JSON 路径（§3.2）；**`normalize_levels`**：是否执行自动规范化（默认 `True`）。 |
+| `sync_build_pageindex_payload(..., *, layout=..., toc_file=..., normalize_levels=...)` | 上式的 `asyncio.run` 包装。 |
+| `async build_pageindex_payload_from_lines(lines, opt, llm_factory, *, doc_id_seed=..., layout=..., toc_entries=..., normalize_levels=...)` | 与上等价，输入为行列表；**`toc_entries`** 直接传入解析后的 TOC 列表（无需文件路径）。 |
+| `sync_build_pageindex_payload_from_lines(..., *, layout=..., toc_entries=..., normalize_levels=...)` | 上式的同步包装。 |
 
 ### 5.2 `build_md_pageindex.py`（页驱动与 `layout`，§3.1）
 
@@ -214,9 +351,9 @@
 ### 5.3 `build_md_pageindex.py`（CLI，`main_argv`）
 
 - 入口：`python build_md_pageindex.py`（模块内 `if __name__ == "__main__"` 调用 `main_argv`）。
-- **`--input-md <path>`**（可省略，默认仓库内 `combined_document.md`）、**`--layout`**（**`h1-forest`**（默认）| **`page-per-page`**）、`--out`（可省略，默认 `out_generated.json`）、`--doc-id`、`--if-add-summary`、`--summary-threshold`、**`--page-title-max-chars`**（默认 50，仅 `page_per_page` 下无 `#`/`##` 的页）、`--model`、`--retrieval-ready`。
+- **`--input-md <path>`**（可省略，默认仓库内 `combined_document.md`）、**`--layout`**（**`h1-forest`**（默认）| **`page-per-page`**）、`--out`（可省略，默认 `out_generated.json`）、`--doc-id`、`--if-add-summary`、`--summary-threshold`、**`--page-title-max-chars`**（默认 50，仅 `page_per_page` 下无 `#`/`##` 的页）、`--model`、`--retrieval-ready`、**`--toc-file <path>`**（TOC JSON 文件路径，§3.2）、**`--no-level-normalize`**（跳过自动层级规范化，§3.2.D）。
 - 分页导出稿（含 MinerU）：与上相同，使用 **`--layout page-per-page`** 并指定 **`--input-md`**；**不再提供** **`--mineru`** 单独入口。
-- 调用 `sync_build_pageindex_payload(md_path, opt, llm_factory=..., layout=...)`，写入 UTF-8 JSON。
+- 调用 `sync_build_pageindex_payload(md_path, opt, llm_factory=..., layout=..., toc_file=..., normalize_levels=...)`，写入 UTF-8 JSON。
 
 ### 5.4 `build_md_pageindex.py` 函数文档字符串约定
 
@@ -248,3 +385,4 @@
 - **2026-04-17（CLI）**：**`--md`** 更名为 **`--input-md`**。
 - **2026-04-17（§3.1.E）**：无 `#`/`##` 的页节点：LLM 短标题（默认 ≤50 字）或启发式截断；§5.2 表格已更新。
 - **2026-04-17（§5.4）**：约定 **`build_md_pageindex.py`** 函数 docstring 须含 **入参 / 返回 / 异常（如有）**；代码侧已补齐未统一处；**`#:`** 用于类型别名说明。
+- **2026-04-20（§3.2）**：新增**标题层级调整**：TOC 驱动的层级覆写（§3.2.C）+ 自动层级规范化（§3.2.D）；支持 `--toc-file` 传入外部 TOC JSON（嵌套树形 / 扁平列表两种格式）；§5.1 函数表新增 `parse_toc_file`、`match_toc_to_headers`、`_normalize_title_for_matching`、`normalize_header_levels`、`_auto_normalize_levels`；CLI 新增 `--toc-file`、`--no-level-normalize`。

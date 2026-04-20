@@ -124,6 +124,17 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional directory for structured debug logs. Falls back to DEMOINDEX_DEBUG_LOG_DIR.",
     )
+    run_parser.add_argument(
+        "--toc-file",
+        default=None,
+        help="Path to a TOC JSON file for title hierarchy adjustment (nested tree or flat list format).",
+    )
+    run_parser.add_argument(
+        "--no-level-normalize",
+        action="store_true",
+        default=False,
+        help="Skip automatic heading level normalization (default: auto-fix level jumps).",
+    )
 
     compare_parser = subparsers.add_parser("compare", help="Compare two tree JSON files.")
     compare_parser.add_argument("--actual-json", required=True, help="Generated tree JSON path.")
@@ -676,6 +687,8 @@ def main() -> int:
             markdown_layout=args.markdown_layout,
             debug_log=args.debug_log,
             debug_log_dir=args.debug_log_dir,
+            toc_file=args.toc_file,
+            normalize_levels=not args.no_level_normalize,
         )
         if not result:
             return 1

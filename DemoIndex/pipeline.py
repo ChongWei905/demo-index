@@ -43,6 +43,8 @@ def build_pageindex_tree(
     markdown_layout: str | None = None,
     debug_log: bool | None = None,
     debug_log_dir: str | None = None,
+    toc_file: str | None = None,
+    normalize_levels: bool = True,
 ) -> dict[str, Any]:
     """Build a target-format tree from one PDF or Markdown input."""
     ensure_pageindex_import_path()
@@ -125,6 +127,8 @@ def build_pageindex_tree(
                 include_summary=effective_include_summary,
                 markdown_layout=resolved_markdown_layout,
                 debug_recorder=debug_recorder,
+                toc_file=toc_file,
+                normalize_levels=normalize_levels,
             )
         if effective_write_postgres:
             with _debug_stage(debug_recorder, "persist_document_sections"):
@@ -677,6 +681,8 @@ def _build_markdown_output(
     include_summary: bool,
     markdown_layout: str,
     debug_recorder: DebugRecorder | None,
+    toc_file: str | None = None,
+    normalize_levels: bool = True,
 ) -> dict[str, Any]:
     """Build the final output payload for one Markdown input."""
     resolved_layout = _resolve_markdown_layout(resolved_input_path, markdown_layout)
@@ -705,6 +711,8 @@ def _build_markdown_output(
                 debug_recorder=debug_recorder,
             ),
             layout=resolved_layout,
+            toc_file=toc_file,
+            normalize_levels=normalize_levels,
         )
     _save_json(artifact_root / "pageindex_raw.json", payload)
     return payload
