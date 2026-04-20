@@ -11,11 +11,16 @@ from unittest.mock import patch
 
 from DemoIndex.build_md_pageindex import (
     PageIndexOptions,
+    _auto_normalize_levels,
+    _normalize_title_for_matching,
     build_forest_from_markdown,
     build_forest_page_per_page_with_doc_root,
     compute_line_count,
+    match_toc_to_headers,
     normalize_display_title,
+    normalize_header_levels,
     parse_page_comments,
+    parse_toc_file,
     sync_build_pageindex_payload,
     sync_build_pageindex_payload_from_lines,
 )
@@ -510,3 +515,335 @@ class MarkdownBuildTests(unittest.TestCase):
         )
 
         self.assertEqual(tree, [{"title": "章节A", "start_index": 1, "end_index": 1}])
+
+
+class TitleLevelNormalizeTests(unittest.TestCase):
+    """Cover TOC-driven level override and automatic level normalization (§3.2)."""
+
+    # --- _normalize_title_for_matching ---
+
+    def test_normalize_title_removes_spaces(self) -> None:
+        self.assertEqual(_normalize_title_for_matching("第一章 概述"), "第一章概述")
+
+    def test_normalize_title_converts_fullwidth_punctuation(self) -> None:
+        self.assertEqual(_normalize_title_for_matching("前言：背景"), "前言:背景")
+        self.assertEqual(_normalize_title_for_matching("列表，项目"), "列表,项目")
+        self.assertEqual(_normalize_title_for_matching("括号（测试）"), "括号(测试)")
+
+    def test_normalize_title_converts_curly_quotes(self) -> None:
+        self.assertEqual(_normalize_title_for_matching("\u201c标题\u201d"), '"标题"')
+
+    def test_normalize_title_lowercases(self) -> None:
+        self.assertEqual(_normalize_title_for_matching("Chapter ONE"), "chapterone")
+
+    # --- _auto_normalize_levels ---
+
+    def test_auto_normalize_eliminates_jumps(self) -> None:
+        headers = [
+            {"line_idx": 0, "level": 1, "raw_title": "A"},
+            {"line_idx": 1, "level": 3, "raw_title": "B"},
+            {"line_idx": 2, "level": 3, "raw_title": "C"},
+            {"line_idx": 3, "level": 5, "raw_title": "D"},
+            {"line_idx": 4, "level": 2, "raw_title": "E"},
+            {"line_idx": 5, "level": 4, "raw_title": "F"},
+        ]
+        _auto_normalize_levels(headers)
+        self.assertEqual([h["level"] for h in headers], [1, 2, 3, 4, 2, 4])
+
+    def test_auto_normalize_no_jump_unchanged(self) -> None:
+        headers = [
+            {"line_idx": 0, "level": 1, "raw_title": "A"},
+            {"line_idx": 1, "level": 2, "raw_title": "B"},
+            {"line_idx": 2, "level": 3, "raw_title": "C"},
+            {"line_idx": 3, "level": 2, "raw_title": "D"},
+            {"line_idx": 4, "level": 3, "raw_title": "E"},
+        ]
+        _auto_normalize_levels(headers)
+        self.assertEqual([h["level"] for h in headers], [1, 2, 3, 2, 3])
+
+    def test_auto_normalize_all_ge2_shifts_down(self) -> None:
+        headers = [
+            {"line_idx": 0, "level": 2, "raw_title": "A"},
+            {"line_idx": 1, "level": 2, "raw_title": "B"},
+            {"line_idx": 2, "level": 3, "raw_title": "C"},
+        ]
+        _auto_normalize_levels(headers)
+        self.assertEqual([h["level"] for h in headers], [1, 1, 2])
+
+    def test_auto_normalize_empty_list(self) -> None:
+        headers: list[dict] = []
+        _auto_normalize_levels(headers)
+        self.assertEqual(headers, [])
+
+    def test_auto_normalize_single_header(self) -> None:
+        headers = [{"line_idx": 0, "level": 5, "raw_title": "A"}]
+        _auto_normalize_levels(headers)
+        self.assertEqual(headers[0]["level"], 1)
+
+    # --- match_toc_to_headers ---
+
+    def test_match_exact_titles(self) -> None:
+        toc = [
+            {"title": "第一章 概述", "level": 1},
+            {"title": "1.1 背景", "level": 2},
+            {"title": "第二章 分析", "level": 1},
+        ]
+        headers = [
+            {"line_idx": 0, "level": 2, "raw_title": "第一章 概述"},
+            {"line_idx": 1, "level": 3, "raw_title": "1.1 背景"},
+            {"line_idx": 2, "level": 2, "raw_title": "第二章 分析"},
+        ]
+        result = match_toc_to_headers(toc, headers)
+        self.assertEqual(result, [1, 2, 1])
+
+    def test_match_toc_is_substring_of_header(self) -> None:
+        toc = [
+            {"title": "概述", "level": 1},
+            {"title": "背景", "level": 2},
+        ]
+        headers = [
+            {"line_idx": 0, "level": 2, "raw_title": "第一章 概述"},
+            {"line_idx": 1, "level": 3, "raw_title": "1.1 背景介绍"},
+        ]
+        result = match_toc_to_headers(toc, headers)
+        self.assertEqual(result, [1, 2])
+
+    def test_match_header_is_substring_of_toc(self) -> None:
+        toc = [
+            {"title": "第一章 概述部分", "level": 1},
+        ]
+        headers = [
+            {"line_idx": 0, "level": 2, "raw_title": "概述部分"},
+        ]
+        result = match_toc_to_headers(toc, headers)
+        self.assertEqual(result, [1])
+
+    def test_match_no_match_returns_none(self) -> None:
+        toc = [
+            {"title": "完全不同", "level": 1},
+        ]
+        headers = [
+            {"line_idx": 0, "level": 2, "raw_title": "第一章 概述"},
+        ]
+        result = match_toc_to_headers(toc, headers)
+        self.assertEqual(result, [None])
+
+    def test_match_toc_entry_used_at_most_once(self) -> None:
+        toc = [
+            {"title": "背景", "level": 2},
+        ]
+        headers = [
+            {"line_idx": 0, "level": 2, "raw_title": "1.1 背景"},
+            {"line_idx": 1, "level": 2, "raw_title": "2.1 背景"},
+        ]
+        result = match_toc_to_headers(toc, headers)
+        self.assertEqual(result[0], 2)
+        self.assertIsNone(result[1])
+
+    def test_match_empty_inputs(self) -> None:
+        self.assertEqual(match_toc_to_headers([], []), [])
+        self.assertEqual(match_toc_to_headers([], [{"line_idx": 0, "level": 1, "raw_title": "A"}]), [None])
+
+    # --- parse_toc_file ---
+
+    def test_parse_toc_nested_format(self) -> None:
+        import json, tempfile, os
+
+        toc_data = [
+            {"title": "第一章", "children": [
+                {"title": "1.1 背景", "children": []},
+                {"title": "1.2 方法", "children": []},
+            ]},
+            {"title": "第二章", "children": [
+                {"title": "2.1 数据", "children": [
+                    {"title": "2.1.1 细节", "children": []},
+                ]},
+            ]},
+        ]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(toc_data, f, ensure_ascii=False)
+            path = f.name
+        try:
+            entries = parse_toc_file(path)
+            self.assertEqual(entries, [
+                {"title": "第一章", "level": 1},
+                {"title": "1.1 背景", "level": 2},
+                {"title": "1.2 方法", "level": 2},
+                {"title": "第二章", "level": 1},
+                {"title": "2.1 数据", "level": 2},
+                {"title": "2.1.1 细节", "level": 3},
+            ])
+        finally:
+            os.unlink(path)
+
+    def test_parse_toc_flat_format(self) -> None:
+        import json, tempfile, os
+
+        toc_data = [
+            {"title": "第一章", "level": 1},
+            {"title": "1.1 背景", "level": 2},
+            {"title": "第二章", "level": 1},
+        ]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(toc_data, f, ensure_ascii=False)
+            path = f.name
+        try:
+            entries = parse_toc_file(path)
+            self.assertEqual(entries, toc_data)
+        finally:
+            os.unlink(path)
+
+    def test_parse_toc_file_not_found(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            parse_toc_file("/nonexistent/path/toc.json")
+
+    def test_parse_toc_invalid_content(self) -> None:
+        import json, tempfile, os
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump({}, f)
+            path = f.name
+        try:
+            with self.assertRaises(ValueError):
+                parse_toc_file(path)
+        finally:
+            os.unlink(path)
+
+    # --- normalize_header_levels ---
+
+    def test_normalize_with_toc_override(self) -> None:
+        toc = [
+            {"title": "第一章 概述", "level": 1},
+            {"title": "1.1 背景", "level": 2},
+            {"title": "第二章 分析", "level": 1},
+        ]
+        headers = [
+            {"line_idx": 0, "level": 2, "raw_title": "第一章 概述"},
+            {"line_idx": 1, "level": 3, "raw_title": "1.1 背景"},
+            {"line_idx": 2, "level": 2, "raw_title": "第二章 分析"},
+        ]
+        normalize_header_levels(headers, toc_entries=toc, normalize_levels=True)
+        self.assertEqual([h["level"] for h in headers], [1, 2, 1])
+
+    def test_normalize_without_toc_auto_only(self) -> None:
+        headers = [
+            {"line_idx": 0, "level": 1, "raw_title": "A"},
+            {"line_idx": 1, "level": 3, "raw_title": "B"},
+            {"line_idx": 2, "level": 3, "raw_title": "C"},
+        ]
+        normalize_header_levels(headers, toc_entries=None, normalize_levels=True)
+        self.assertEqual([h["level"] for h in headers], [1, 2, 3])
+
+    def test_normalize_skip_when_disabled(self) -> None:
+        headers = [
+            {"line_idx": 0, "level": 1, "raw_title": "A"},
+            {"line_idx": 1, "level": 5, "raw_title": "B"},
+        ]
+        normalize_header_levels(headers, normalize_levels=False)
+        self.assertEqual([h["level"] for h in headers], [1, 5])
+
+    def test_normalize_toc_partial_match_then_auto(self) -> None:
+        toc = [
+            {"title": "第一章", "level": 1},
+        ]
+        headers = [
+            {"line_idx": 0, "level": 2, "raw_title": "第一章"},
+            {"line_idx": 1, "level": 5, "raw_title": "未匹配标题"},
+        ]
+        normalize_header_levels(headers, toc_entries=toc, normalize_levels=True)
+        self.assertEqual(headers[0]["level"], 1)
+        self.assertEqual(headers[1]["level"], 2)
+
+    # --- Integration: build_forest_from_markdown with toc_entries ---
+
+    def test_build_forest_with_toc_adjusts_levels(self) -> None:
+        markdown = textwrap.dedent(
+            """\
+            # 第一章 概述
+
+            intro
+
+            ### 1.1 背景
+
+            body
+
+            # 第二章 分析
+
+            analysis
+            """
+        )
+        lines = markdown.strip().split("\n")
+        toc = [
+            {"title": "第一章 概述", "level": 1},
+            {"title": "1.1 背景", "level": 2},
+            {"title": "第二章 分析", "level": 1},
+        ]
+        forest = build_forest_from_markdown(
+            lines, parse_page_comments(lines),
+            toc_entries=toc, normalize_levels=True,
+        )
+        self.assertEqual(len(forest), 2)
+        self.assertEqual(forest[0]["title"], "第一章 概述")
+        self.assertEqual(forest[0]["nodes"][0]["title"], "1.1 背景")
+        self.assertEqual(forest[1]["title"], "第二章 分析")
+
+    def test_build_forest_auto_normalize_without_toc(self) -> None:
+        markdown = textwrap.dedent(
+            """\
+            # Title
+
+            ### Skipped Level
+
+            body
+            """
+        )
+        lines = markdown.strip().split("\n")
+        forest = build_forest_from_markdown(
+            lines, parse_page_comments(lines),
+            toc_entries=None, normalize_levels=True,
+        )
+        self.assertEqual(forest[0]["nodes"][0]["title"], "Skipped Level")
+
+    # --- Integration: sync_build_pageindex_payload with toc_file ---
+
+    def test_sync_build_with_toc_file(self) -> None:
+        import json, tempfile, os
+
+        toc_data = [
+            {"title": "Alpha", "level": 1},
+            {"title": "Beta", "level": 2},
+        ]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(toc_data, f, ensure_ascii=False)
+            toc_path = f.name
+
+        md_path = Path(self.id().replace(".", "_") + ".md")
+        try:
+            md_path.write_text("# Alpha\n\nintro\n\n## Beta\n\nbody\n", encoding="utf-8")
+            payload = sync_build_pageindex_payload(
+                md_path,
+                PageIndexOptions(if_add_summary=False, doc_id="toc-test-id"),
+                llm_factory=None,
+                toc_file=toc_path,
+                normalize_levels=True,
+            )
+            self.assertEqual(payload["doc_id"], "toc-test-id")
+            self.assertEqual(len(payload["result"]), 1)
+            self.assertEqual(payload["result"][0]["title"], "Alpha")
+        finally:
+            md_path.unlink(missing_ok=True)
+            os.unlink(toc_path)
+
+    def test_sync_build_no_level_normalize_flag(self) -> None:
+        md_path = Path(self.id().replace(".", "_") + ".md")
+        try:
+            md_path.write_text("# A\n\n### B\n\nbody\n", encoding="utf-8")
+            payload = sync_build_pageindex_payload(
+                md_path,
+                PageIndexOptions(if_add_summary=False, doc_id="no-norm-id"),
+                llm_factory=None,
+                normalize_levels=False,
+            )
+            self.assertEqual(payload["result"][0]["nodes"][0]["title"], "B")
+        finally:
+            md_path.unlink(missing_ok=True)
