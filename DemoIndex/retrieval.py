@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -524,6 +525,22 @@ def parse_query(
         parse_fallback_model=parse_fallback_model or config.retrieval.parse_fallback_model,
         retrieval_profile_path=retrieval_profile_path or config.retrieval_profile_path,
         debug_recorder=None,
+    )
+
+
+def _create_retrieval_chat_client(
+    *,
+    primary_model: str,
+    fallback_model: str,
+    debug_recorder: DebugRecorder | None,
+) -> QwenChatClient:
+    """Build one retrieval-side chat client with thinking mode disabled by default."""
+    return QwenChatClient(
+        primary_model=primary_model,
+        fallback_model=fallback_model,
+        enable_thinking=False,
+        strip_thinking_field=True,
+        debug_recorder=debug_recorder,
     )
 
 
@@ -1495,9 +1512,11 @@ def _localize_sections_internal(
         search_terms = _derive_search_terms(stage12_result.query_understanding)
         localized_docs: list[LocalizedDoc] = []
         localized_sections: list[LocalizedSection] = []
+        doc_localization_plans: list[dict[str, Any]] = []
+        rerank_requests: list[dict[str, Any]] = []
         llm_client = None
         if mode == "hybrid":
-            llm_client = QwenChatClient(
+            llm_client = _create_retrieval_chat_client(
                 primary_model=rerank_model,
                 fallback_model=rerank_fallback_model,
                 debug_recorder=debug_recorder,
@@ -1553,35 +1572,72 @@ def _localize_sections_internal(
                     shortlist_section_ids=[item.section_id for item in heuristic_sections[:stage3_shortlist_size]],
                 )
 
-            mode_used: Literal["heuristic", "hybrid"] = "heuristic"
-            localized_for_doc = heuristic_sections
             if mode == "hybrid" and llm_client is not None and heuristic_sections:
-                reranked_sections = _rerank_stage3_sections_with_llm(
-                    query_understanding=stage12_result.query_understanding,
-                    anchor_sections=anchor_sections,
-                    shortlisted_sections=heuristic_sections[:stage3_shortlist_size],
-                    top_k_tree_sections_per_doc=top_k_tree_sections_per_doc,
-                    llm_client=llm_client,
-                    rerank_model=rerank_model,
-                    debug_recorder=debug_recorder,
-                    doc_id=doc_candidate.doc_id,
+                rerank_requests.append(
+                    {
+                        "doc_id": doc_candidate.doc_id,
+                        "query_understanding": stage12_result.query_understanding,
+                        "anchor_sections": anchor_sections,
+                        "shortlisted_sections": heuristic_sections[:stage3_shortlist_size],
+                        "top_k_tree_sections_per_doc": top_k_tree_sections_per_doc,
+                    }
                 )
-                if reranked_sections is not None:
-                    localized_for_doc = reranked_sections
-                    mode_used = "hybrid"
-                elif debug_recorder is not None:
-                    debug_recorder.log_event(
-                        "stage3_hybrid_fallback",
-                        doc_id=doc_candidate.doc_id,
-                        reason="llm_rerank_failed_or_empty",
+
+            doc_localization_plans.append(
+                {
+                    "doc_id": doc_candidate.doc_id,
+                    "doc_score": doc_candidate.doc_score,
+                    "anchor_sections": anchor_sections,
+                    "heuristic_sections": heuristic_sections,
+                }
+            )
+
+        reranked_by_doc: dict[str, list[LocalizedSection] | None] = {}
+        if mode == "hybrid" and llm_client is not None and rerank_requests:
+            if debug_recorder is not None:
+                debug_recorder.log_event(
+                    "stage3_hybrid_batch_start",
+                    doc_count=len(rerank_requests),
+                    max_concurrency=min(len(rerank_requests), llm_client.max_concurrency),
+                )
+            try:
+                reranked_by_doc = asyncio.run(
+                    _rerank_stage3_documents_with_llm_async(
+                        rerank_requests=rerank_requests,
+                        llm_client=llm_client,
+                        rerank_model=rerank_model,
+                        debug_recorder=debug_recorder,
                     )
+                )
+            except Exception as exc:  # noqa: PERF203
+                if debug_recorder is not None:
+                    debug_recorder.log_event(
+                        "stage3_hybrid_batch_error",
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
+                reranked_by_doc = {}
+
+        for plan in doc_localization_plans:
+            mode_used: Literal["heuristic", "hybrid"] = "heuristic"
+            localized_for_doc = plan["heuristic_sections"]
+            reranked_sections = reranked_by_doc.get(plan["doc_id"])
+            if reranked_sections is not None:
+                localized_for_doc = reranked_sections
+                mode_used = "hybrid"
+            elif mode == "hybrid" and plan["heuristic_sections"] and debug_recorder is not None:
+                debug_recorder.log_event(
+                    "stage3_hybrid_fallback",
+                    doc_id=plan["doc_id"],
+                    reason="llm_rerank_failed_or_empty",
+                )
 
             localized_docs.append(
                 LocalizedDoc(
-                    doc_id=doc_candidate.doc_id,
-                    doc_score=doc_candidate.doc_score,
+                    doc_id=plan["doc_id"],
+                    doc_score=plan["doc_score"],
                     mode_used=mode_used,
-                    anchor_sections=anchor_sections,
+                    anchor_sections=plan["anchor_sections"],
                     localized_sections=localized_for_doc,
                 )
             )
@@ -1740,7 +1796,7 @@ def _package_evidence_internal(
         )
         labeled_items = evidence_items
         if relation_mode == "hybrid" and evidence_items:
-            llm_client = QwenChatClient(
+            llm_client = _create_retrieval_chat_client(
                 primary_model=relation_model,
                 fallback_model=relation_fallback_model,
                 debug_recorder=debug_recorder,
@@ -2473,7 +2529,7 @@ def _enrich_query_with_llm(
     debug_recorder: DebugRecorder | None,
 ) -> QueryUnderstanding:
     """Use one LLM pass to supplement weak or missing query fields."""
-    client = QwenChatClient(
+    client = _create_retrieval_chat_client(
         primary_model=parse_model,
         fallback_model=parse_fallback_model,
         debug_recorder=debug_recorder,
@@ -3146,7 +3202,84 @@ def _rerank_stage3_sections_with_llm(
     doc_id: str,
 ) -> list[LocalizedSection] | None:
     """Rerank one document's shortlisted sections with one LLM call."""
-    prompt = f"""
+    prompt = _build_stage3_rerank_prompt(
+        query_understanding=query_understanding,
+        anchor_sections=anchor_sections,
+        shortlisted_sections=shortlisted_sections,
+    )
+    try:
+        response = llm_client.completion(rerank_model, prompt)
+        payload = _extract_json_payload(response)
+        ranked_sections = payload.get("ranked_sections")
+        if not isinstance(ranked_sections, list):
+            raise ValueError("ranked_sections must be a list")
+    except Exception as exc:  # noqa: PERF203
+        if debug_recorder is not None:
+            debug_recorder.log_event(
+                "stage3_llm_rerank_error",
+                doc_id=doc_id,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+        return None
+    return _apply_stage3_rerank_result(
+        ranked_sections=ranked_sections,
+        shortlisted_sections=shortlisted_sections,
+        debug_recorder=debug_recorder,
+        doc_id=doc_id,
+        top_k_tree_sections_per_doc=top_k_tree_sections_per_doc,
+    )
+
+
+async def _rerank_stage3_sections_with_llm_async(
+    *,
+    query_understanding: QueryUnderstanding,
+    anchor_sections: list[SectionCandidate],
+    shortlisted_sections: list[LocalizedSection],
+    top_k_tree_sections_per_doc: int,
+    llm_client: QwenChatClient,
+    rerank_model: str,
+    debug_recorder: DebugRecorder | None,
+    doc_id: str,
+) -> list[LocalizedSection] | None:
+    """Rerank one document's shortlisted sections with one async LLM call."""
+    prompt = _build_stage3_rerank_prompt(
+        query_understanding=query_understanding,
+        anchor_sections=anchor_sections,
+        shortlisted_sections=shortlisted_sections,
+    )
+    try:
+        response = await llm_client.acompletion(rerank_model, prompt)
+        payload = _extract_json_payload(response)
+        ranked_sections = payload.get("ranked_sections")
+        if not isinstance(ranked_sections, list):
+            raise ValueError("ranked_sections must be a list")
+    except Exception as exc:  # noqa: PERF203
+        if debug_recorder is not None:
+            debug_recorder.log_event(
+                "stage3_llm_rerank_error",
+                doc_id=doc_id,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+        return None
+    return _apply_stage3_rerank_result(
+        ranked_sections=ranked_sections,
+        shortlisted_sections=shortlisted_sections,
+        debug_recorder=debug_recorder,
+        doc_id=doc_id,
+        top_k_tree_sections_per_doc=top_k_tree_sections_per_doc,
+    )
+
+
+def _build_stage3_rerank_prompt(
+    *,
+    query_understanding: QueryUnderstanding,
+    anchor_sections: list[SectionCandidate],
+    shortlisted_sections: list[LocalizedSection],
+) -> str:
+    """Build the Stage 3 rerank prompt for one document."""
+    return f"""
 You are ranking sections inside one research report for retrieval.
 Return only JSON with this shape:
 {{
@@ -3167,22 +3300,17 @@ Anchor sections:
 Shortlisted sections:
 {json.dumps([section.to_dict() for section in shortlisted_sections], ensure_ascii=False)}
 """.strip()
-    try:
-        response = llm_client.completion(rerank_model, prompt)
-        payload = _extract_json_payload(response)
-        ranked_sections = payload.get("ranked_sections")
-        if not isinstance(ranked_sections, list):
-            raise ValueError("ranked_sections must be a list")
-    except Exception as exc:  # noqa: PERF203
-        if debug_recorder is not None:
-            debug_recorder.log_event(
-                "stage3_llm_rerank_error",
-                doc_id=doc_id,
-                error_type=type(exc).__name__,
-                error_message=str(exc),
-            )
-        return None
 
+
+def _apply_stage3_rerank_result(
+    *,
+    ranked_sections: list[Any],
+    shortlisted_sections: list[LocalizedSection],
+    debug_recorder: DebugRecorder | None,
+    doc_id: str,
+    top_k_tree_sections_per_doc: int,
+) -> list[LocalizedSection] | None:
+    """Apply one parsed Stage 3 rerank payload to the shortlisted sections."""
     shortlist_lookup = {section.section_id: section for section in shortlisted_sections}
     llm_rankings: list[tuple[LocalizedSection, str, int]] = []
     for rank, item in enumerate(ranked_sections, start=1):
@@ -3253,6 +3381,32 @@ Shortlisted sections:
             llm_reasons=llm_reason_by_section,
         )
     return reranked_sections
+
+
+async def _rerank_stage3_documents_with_llm_async(
+    *,
+    rerank_requests: list[dict[str, Any]],
+    llm_client: QwenChatClient,
+    rerank_model: str,
+    debug_recorder: DebugRecorder | None,
+) -> dict[str, list[LocalizedSection] | None]:
+    """Run Stage 3 LLM rerank for multiple documents concurrently."""
+
+    async def _one_request(request: dict[str, Any]) -> tuple[str, list[LocalizedSection] | None]:
+        reranked = await _rerank_stage3_sections_with_llm_async(
+            query_understanding=request["query_understanding"],
+            anchor_sections=request["anchor_sections"],
+            shortlisted_sections=request["shortlisted_sections"],
+            top_k_tree_sections_per_doc=request["top_k_tree_sections_per_doc"],
+            llm_client=llm_client,
+            rerank_model=rerank_model,
+            debug_recorder=debug_recorder,
+            doc_id=request["doc_id"],
+        )
+        return request["doc_id"], reranked
+
+    results = await asyncio.gather(*[_one_request(request) for request in rerank_requests])
+    return {doc_id: reranked for doc_id, reranked in results}
 
 
 def _create_debug_recorder(*, debug_log: bool, debug_log_dir: str | None) -> DebugRecorder | None:

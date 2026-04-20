@@ -39,6 +39,7 @@ def _maybe_reexec_into_pageindex_venv() -> None:
 
 _maybe_reexec_into_pageindex_venv()
 
+from .benchmark import benchmark_pdf_strategies
 from .pipeline import build_pageindex_tree, compare_tree
 from .retrieval import retrieve_candidates, retrieve_evidence, retrieve_tree_candidates
 from .env import get_demoindex_config
@@ -131,6 +132,60 @@ def _parse_args() -> argparse.Namespace:
         "--output-json",
         default=None,
         help="Optional path for saving the comparison report as JSON.",
+    )
+
+    benchmark_parser = subparsers.add_parser(
+        "benchmark-build",
+        help="Benchmark multiple PDF build strategies against official PageIndex trees.",
+        description=f"Run build-strategy benchmarks for one or more PDFs. {CLI_DEFAULTS_NOTE}",
+    )
+    benchmark_parser.add_argument(
+        "--pdf-path",
+        action="append",
+        dest="pdf_paths",
+        default=None,
+        help="PDF path to benchmark. Repeat to add more PDFs. Uses the built-in two-document benchmark set when omitted.",
+    )
+    benchmark_parser.add_argument(
+        "--official-tree",
+        action="append",
+        dest="official_trees",
+        default=None,
+        help="Optional mapping in the form <pdf_filename>=<official_tree_json>. Repeat to add more mappings.",
+    )
+    benchmark_parser.add_argument(
+        "--output-dir",
+        required=True,
+        help="Directory where benchmark trees, debug logs, and the summary JSON will be written.",
+    )
+    benchmark_parser.add_argument(
+        "--output-json",
+        default=None,
+        help="Optional explicit summary JSON path. Defaults to <output-dir>/benchmark_summary.json.",
+    )
+    benchmark_parser.add_argument(
+        "--strategy",
+        action="append",
+        dest="strategies",
+        default=None,
+        choices=("auto", "toc_seeded", "pageindex_native", "layout_fallback"),
+        help="Strategy to run. Repeat to benchmark multiple strategies.",
+    )
+    benchmark_parser.add_argument(
+        "--model",
+        default=None,
+        help="Primary chat model override for benchmark builds.",
+    )
+    benchmark_parser.add_argument(
+        "--fallback-model",
+        default=None,
+        help="Fallback chat model override for benchmark builds.",
+    )
+    benchmark_parser.add_argument(
+        "--include-summary",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether benchmark runs should generate node summaries.",
     )
 
     retrieve_parser = subparsers.add_parser(
@@ -577,6 +632,19 @@ def _resolve_run_input_path(args: argparse.Namespace) -> Path:
     return Path(selected).expanduser().resolve()
 
 
+def _parse_official_tree_args(values: list[str] | None) -> dict[str, str] | None:
+    """Parse repeated `<pdf_filename>=<official_tree_path>` benchmark mappings."""
+    if not values:
+        return None
+    mapping: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError("--official-tree must use the form <pdf_filename>=<official_tree_json>.")
+        name, path = value.split("=", 1)
+        mapping[name.strip()] = path.strip()
+    return mapping
+
+
 def main() -> int:
     """Run the DemoIndex CLI."""
     args = _parse_args()
@@ -625,6 +693,26 @@ def main() -> int:
             print(output_path)
         else:
             print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "benchmark-build":
+        output_dir = Path(args.output_dir).expanduser().resolve()
+        report = benchmark_pdf_strategies(
+            pdf_paths=args.pdf_paths,
+            official_tree_paths=_parse_official_tree_args(args.official_trees),
+            output_dir=str(output_dir),
+            strategies=args.strategies,
+            model=args.model,
+            fallback_model=args.fallback_model,
+            include_summary=bool(args.include_summary),
+        )
+        output_path = (
+            Path(args.output_json).expanduser().resolve()
+            if args.output_json
+            else output_dir / "benchmark_summary.json"
+        )
+        output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(output_path)
         return 0
 
     if args.command == "retrieve":

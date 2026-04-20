@@ -17,6 +17,7 @@ except Exception:  # pragma: no cover - bootstrap fallback
 
 ApiProvider = Literal["dashscope", "openai"]
 StageMode = Literal["heuristic", "hybrid"]
+BuildPdfStrategy = Literal["auto", "toc_seeded", "pageindex_native", "layout_fallback"]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEMOINDEX_ROOT = REPO_ROOT / "DemoIndex"
@@ -45,6 +46,7 @@ DEFAULT_BUILD_WRITE_POSTGRES = False
 DEFAULT_BUILD_WRITE_GLOBAL_INDEX = False
 DEFAULT_BUILD_GLOBAL_INDEX_MODEL = "text-embedding-v4"
 DEFAULT_BUILD_MARKDOWN_LAYOUT = "auto"
+DEFAULT_BUILD_PDF_STRATEGY: BuildPdfStrategy = "auto"
 
 DEFAULT_RETRIEVAL_USE_LLM_PARSE = True
 DEFAULT_RETRIEVAL_PARSE_MODEL = "dashscope/qwen3.6-plus"
@@ -129,6 +131,7 @@ class BuildDefaults:
     write_global_index: bool
     global_index_model: str
     markdown_layout: str
+    pdf_strategy: BuildPdfStrategy
     artifacts_dir: str | None
 
 
@@ -407,6 +410,10 @@ def get_demoindex_config() -> DemoIndexConfig:
             or DEFAULT_BUILD_GLOBAL_INDEX_MODEL,
             markdown_layout=_get_env_optional_str("DEMOINDEX_BUILD_MARKDOWN_LAYOUT")
             or DEFAULT_BUILD_MARKDOWN_LAYOUT,
+            pdf_strategy=_get_env_build_pdf_strategy(
+                "DEMOINDEX_BUILD_PDF_STRATEGY",
+                DEFAULT_BUILD_PDF_STRATEGY,
+            ),
             artifacts_dir=_get_env_optional_str("DEMOINDEX_BUILD_ARTIFACTS_DIR"),
         ),
         retrieval=retrieval_defaults,
@@ -469,6 +476,16 @@ def _get_env_stage_mode(name: str, default: StageMode) -> StageMode:
     value = (_get_env_optional_str(name) or default).strip().lower()
     if value not in {"heuristic", "hybrid"}:
         raise ValueError(f"{name} must be one of: heuristic, hybrid.")
+    return value  # type: ignore[return-value]
+
+
+def _get_env_build_pdf_strategy(name: str, default: BuildPdfStrategy) -> BuildPdfStrategy:
+    """Parse one PDF build strategy environment variable."""
+    value = (_get_env_optional_str(name) or default).strip().lower()
+    if value not in {"auto", "toc_seeded", "pageindex_native", "layout_fallback"}:
+        raise ValueError(
+            f"{name} must be one of: auto, toc_seeded, pageindex_native, layout_fallback."
+        )
     return value  # type: ignore[return-value]
 
 

@@ -13,6 +13,8 @@ from .models import OutlineEntry, PageArtifact, TextSpan, VisualRegion
 
 
 _TITLE_CLEAN_RE = re.compile(r"\s+")
+
+
 def normalize_text(text: str) -> str:
     """Normalize text for fuzzy title matching."""
     compact = _TITLE_CLEAN_RE.sub("", text or "")
@@ -58,10 +60,11 @@ def extract_page_artifacts(pdf_path: str | Path, artifacts_dir: str | Path) -> l
                 for line in block.get("lines", []):
                     line_parts: list[str] = []
                     for span in line.get("spans", []):
-                        text = " ".join(str(span.get("text", "")).split())
+                        span_text = _sanitize_pdf_text(span.get("text", ""))
+                        text = " ".join(str(span_text).split())
                         if not text:
                             continue
-                        line_parts.append(str(span.get("text", "")))
+                        line_parts.append(str(span_text))
                         font_name = str(span.get("font", ""))
                         flags = int(span.get("flags", 0))
                         spans.append(
@@ -77,7 +80,7 @@ def extract_page_artifacts(pdf_path: str | Path, artifacts_dir: str | Path) -> l
                     if line_text:
                         lines.append((line_text, _to_bbox(line.get("bbox"))))
 
-            plain_text = " ".join(page.get_text().split())
+            plain_text = " ".join(_sanitize_pdf_text(page.get_text()).split())
             drawing_bboxes = [
                 _to_bbox(drawing["rect"])
                 for drawing in page.get_drawings()
@@ -133,39 +136,64 @@ def extract_page_artifacts(pdf_path: str | Path, artifacts_dir: str | Path) -> l
 
 def detect_toc_page(pages: list[PageArtifact]) -> int | None:
     """Return the likely physical TOC page number, if one is found."""
-    best_page: int | None = None
-    best_score = 0
+    candidate_pages = detect_toc_candidate_pages(pages)
+    if not candidate_pages:
+        return None
+    return candidate_pages[0]
+
+
+def detect_toc_candidate_pages(pages: list[PageArtifact]) -> list[int]:
+    """Return the strongest consecutive TOC page candidates near the document front."""
+    candidate_scores: dict[int, int] = {}
     for page in pages[: min(20, len(pages))]:
-        score = 0
-        text = page.plain_text
-        if "目录" in text:
-            score += 10
-        score += len(re.findall(r"(?:\.{4,}|…{2,}|：|:)\s*\d+", text))
-        if page.text_block_count <= 20:
-            score += 1
-        if score > best_score:
-            best_score = score
-            best_page = page.page_number
-    return best_page if best_score > 0 else None
+        score = _toc_candidate_score(page)
+        if score > 0:
+            candidate_scores[page.page_number] = score
+    if not candidate_scores:
+        return []
+
+    best_page = max(candidate_scores, key=lambda page_number: candidate_scores[page_number])
+    selected = [best_page]
+
+    previous_page = best_page - 1
+    while previous_page in candidate_scores:
+        selected.insert(0, previous_page)
+        previous_page -= 1
+
+    next_page = best_page + 1
+    while next_page in candidate_scores:
+        selected.append(next_page)
+        next_page += 1
+
+    return selected
 
 
 def extract_outline_entries(pages: list[PageArtifact]) -> tuple[int | None, list[OutlineEntry]]:
     """Extract TOC entries with indentation-based level hints."""
-    toc_page_number = detect_toc_page(pages)
-    if toc_page_number is None:
+    toc_page_numbers = detect_toc_candidate_pages(pages)
+    if not toc_page_numbers:
         return None, []
 
-    toc_page = pages[toc_page_number - 1]
+    toc_page_number = toc_page_numbers[0]
     candidates: list[tuple[float, str, int, tuple[float, float, float, float]]] = []
-    for line_text, bbox in toc_page.lines:
-        cleaned = " ".join(line_text.split())
-        parsed = _parse_toc_line(cleaned)
-        if parsed is None:
-            continue
-        title, printed_page = parsed
-        if not title or title == "目录":
-            continue
-        candidates.append((bbox[0], title, printed_page, bbox))
+    seen_entries: set[tuple[str, int]] = set()
+    for page_number in toc_page_numbers:
+        toc_page = pages[page_number - 1]
+        for line_text, bbox in toc_page.lines:
+            cleaned = " ".join(line_text.split())
+            parsed = _parse_toc_line(cleaned)
+            if parsed is None:
+                continue
+            title, printed_page = parsed
+            if not _is_reasonable_toc_printed_page(printed_page, total_pages=len(pages)):
+                continue
+            if not title or title == "目录":
+                continue
+            dedupe_key = (normalize_text(title), printed_page)
+            if dedupe_key in seen_entries:
+                continue
+            seen_entries.add(dedupe_key)
+            candidates.append((bbox[0], title, printed_page, bbox))
 
     if not candidates:
         return toc_page_number, []
@@ -190,6 +218,49 @@ def extract_outline_entries(pages: list[PageArtifact]) -> tuple[int | None, list
         if 1 <= physical <= len(pages):
             entry.physical_page = physical
     return toc_page_number, raw_entries
+
+
+def assess_outline_confidence(
+    pages: list[PageArtifact],
+    toc_page_number: int | None,
+    outline_entries: list[OutlineEntry],
+) -> dict[str, object]:
+    """Score whether TOC-derived outline entries are strong enough to drive seeded build."""
+    candidate_pages = detect_toc_candidate_pages(pages)
+    mapped_entries = [entry for entry in outline_entries if entry.physical_page is not None]
+    mapped_ratio = len(mapped_entries) / len(outline_entries) if outline_entries else 0.0
+    distinct_levels = len({max(1, int(entry.level_hint)) for entry in outline_entries})
+    numbered_entries = sum(1 for entry in outline_entries if _title_has_structure_number(entry.title))
+    numbered_ratio = numbered_entries / len(outline_entries) if outline_entries else 0.0
+    mapped_pages = sorted({int(entry.physical_page) for entry in mapped_entries if entry.physical_page is not None})
+    page_span = mapped_pages[-1] - mapped_pages[0] if len(mapped_pages) >= 2 else 0
+    has_explicit_toc_title = any("目录" in pages[page_number - 1].plain_text for page_number in candidate_pages)
+    satisfied_signals = sum(
+        [
+            bool(candidate_pages and (has_explicit_toc_title or len(candidate_pages) >= 2)),
+            len(outline_entries) >= 5,
+            mapped_ratio >= 0.6,
+            distinct_levels >= 2 or numbered_ratio >= 0.4,
+            page_span >= 3,
+        ]
+    )
+    confidence = "none"
+    if toc_page_number is not None and satisfied_signals >= 4:
+        confidence = "high"
+    elif toc_page_number is not None and satisfied_signals >= 2:
+        confidence = "low"
+    return {
+        "confidence": confidence,
+        "score": round(satisfied_signals / 5.0, 3),
+        "candidate_pages": candidate_pages,
+        "toc_page_number": toc_page_number,
+        "outline_entry_count": len(outline_entries),
+        "mapped_entry_ratio": round(mapped_ratio, 3),
+        "distinct_level_count": distinct_levels,
+        "numbered_entry_ratio": round(numbered_ratio, 3),
+        "page_span": page_span,
+        "has_explicit_toc_title": has_explicit_toc_title,
+    }
 
 
 def infer_page_offset(outline_entries: list[OutlineEntry], pages: list[PageArtifact]) -> int:
@@ -322,6 +393,14 @@ def _parse_toc_line(text: str) -> tuple[str, int] | None:
     return title, int(match.group("page"))
 
 
+def _is_reasonable_toc_printed_page(printed_page: int, *, total_pages: int) -> bool:
+    """Return whether one parsed TOC page number is plausible for the current document."""
+    if printed_page < 1:
+        return False
+    upper_bound = max(total_pages * 3, total_pages + 20)
+    return printed_page <= upper_bound
+
+
 def _build_toc_level_map(x_positions: list[float]) -> dict[float, int]:
     """Map TOC x positions to indentation levels while handling multi-column layouts."""
     if not x_positions:
@@ -349,6 +428,32 @@ def _build_toc_level_map(x_positions: list[float]) -> dict[float, int]:
             for value in bucket:
                 mapping[value] = index
     return mapping
+
+
+def _toc_candidate_score(page: PageArtifact) -> int:
+    """Return one heuristic TOC score for a front-matter page."""
+    text = page.plain_text
+    toc_pattern_matches = len(re.findall(r"(?:\.{4,}|…{2,}|：|:)\s*\d+", text))
+    parsed_line_matches = sum(1 for line_text, _bbox in page.lines if _parse_toc_line(" ".join(line_text.split())))
+    has_explicit_toc_title = "目录" in text
+    if not has_explicit_toc_title and max(toc_pattern_matches, parsed_line_matches) < 2:
+        return 0
+    score = 0
+    if has_explicit_toc_title:
+        score += 10
+    score += toc_pattern_matches
+    score += min(parsed_line_matches, 5)
+    if page.text_block_count <= 20:
+        score += 1
+    return score
+
+
+def _title_has_structure_number(title: str) -> bool:
+    """Return whether one title begins with a common section numbering prefix."""
+    stripped = title.strip()
+    return bool(
+        re.match(r"^(?:\d+(?:\.\d+)*|\d{2}|[一二三四五六七八九十]+[、.]|[（(][一二三四五六七八九十\d]+[）)])", stripped)
+    )
 def _to_bbox(value) -> tuple[float, float, float, float]:
     if value is None:
         return (0.0, 0.0, 0.0, 0.0)
@@ -405,3 +510,9 @@ def _median(values: list[float]) -> float | None:
     if len(ordered) % 2 == 1:
         return ordered[midpoint]
     return (ordered[midpoint - 1] + ordered[midpoint]) / 2
+
+
+def _sanitize_pdf_text(text: object) -> str:
+    """Drop invalid Unicode surrogates that cannot be forwarded to LLM or storage layers."""
+    normalized = str(text or "")
+    return normalized.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")

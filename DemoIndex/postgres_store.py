@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 from .env import get_demoindex_config
@@ -71,6 +71,7 @@ def persist_document_sections(
     """Persist one DemoIndex tree payload into PostgreSQL."""
     resolved_database_url = resolve_database_url(database_url)
     records = flatten_document_sections(tree_payload)
+    records, sanitization = _sanitize_section_records(records)
     psycopg = _import_psycopg()
 
     with psycopg.connect(resolved_database_url) as connection:
@@ -112,6 +113,7 @@ def persist_document_sections(
         "table_name": SECTION_TABLE_NAME,
         "doc_id": str(tree_payload.get("doc_id") or ""),
         "row_count": len(records),
+        "sanitized_nul_byte_count": sanitization["nul_byte_count"],
         "records": [asdict(record) for record in records[:5]],
     }
 
@@ -134,7 +136,7 @@ def flatten_document_sections(tree_payload: dict[str, Any]) -> list[SectionRecor
 
 def flatten_tree_sections(tree_payload: dict[str, Any]) -> list[FlattenedSection]:
     """Flatten a DemoIndex output tree into preorder sections with paths and text."""
-    doc_id = str(tree_payload.get("doc_id") or "").strip()
+    doc_id = _strip_nul_bytes(str(tree_payload.get("doc_id") or "")).strip()
     if not doc_id:
         raise ValueError("Tree payload is missing a top-level doc_id.")
 
@@ -147,10 +149,10 @@ def flatten_tree_sections(tree_payload: dict[str, Any]) -> list[FlattenedSection
         path_titles: list[str],
     ) -> None:
         for node in nodes:
-            node_id = str(node.get("node_id") or "").strip()
-            title = str(node.get("title") or "").strip()
-            summary = str(node.get("summary") or "").strip()
-            text = str(node.get("text") or "")
+            node_id = _strip_nul_bytes(str(node.get("node_id") or "")).strip()
+            title = _strip_nul_bytes(str(node.get("title") or "")).strip()
+            summary = _strip_nul_bytes(str(node.get("summary") or "")).strip()
+            text = _strip_nul_bytes(str(node.get("text") or ""))
             if not node_id:
                 raise ValueError(f"Encountered a node without node_id under doc_id={doc_id}.")
             if not title:
@@ -172,7 +174,7 @@ def flatten_tree_sections(tree_payload: dict[str, Any]) -> list[FlattenedSection
                     title=title,
                     depth=depth,
                     summary=summary,
-                    title_path=" > ".join(part for part in current_path if part),
+                    title_path=_strip_nul_bytes(" > ".join(part for part in current_path if part)),
                     page_index=_coerce_page_index(node.get("page_index")),
                     text=text,
                     is_leaf=not children,
@@ -192,8 +194,9 @@ def persist_section_chunks(
 ) -> dict[str, Any]:
     """Persist one document's global chunk index into PostgreSQL."""
     resolved_database_url = resolve_database_url(database_url)
+    sanitized_chunk_records, sanitization = _sanitize_chunk_records(chunk_records)
     psycopg = _import_psycopg()
-    embedding_dimension = _resolve_chunk_embedding_dimension(chunk_records)
+    embedding_dimension = _resolve_chunk_embedding_dimension(sanitized_chunk_records)
 
     with psycopg.connect(resolved_database_url) as connection:
         with connection.transaction():
@@ -203,7 +206,7 @@ def persist_section_chunks(
                     f"DELETE FROM {CHUNK_TABLE_NAME} WHERE doc_id = %s",
                     (doc_id,),
                 )
-                if chunk_records:
+                if sanitized_chunk_records:
                     cursor.executemany(
                         f"""
                         INSERT INTO {CHUNK_TABLE_NAME} (
@@ -243,14 +246,15 @@ def persist_section_chunks(
                                     expected_dimension=embedding_dimension,
                                 ),
                             )
-                            for record in chunk_records
+                            for record in sanitized_chunk_records
                         ],
                     )
 
     return {
         "table_name": CHUNK_TABLE_NAME,
         "doc_id": doc_id,
-        "row_count": len(chunk_records),
+        "row_count": len(sanitized_chunk_records),
+        "sanitized_nul_byte_count": sanitization["nul_byte_count"],
         "records": [
             {
                 "chunk_id": record.chunk_id,
@@ -263,7 +267,7 @@ def persist_section_chunks(
                 "token_count": record.token_count,
                 "text_hash": record.text_hash,
             }
-            for record in chunk_records[:5]
+            for record in sanitized_chunk_records[:5]
         ],
     }
 
@@ -412,3 +416,75 @@ def _vector_literal(values: list[float], *, expected_dimension: int) -> str:
             f"Embedding dimension mismatch: expected {expected_dimension}, got {len(values)}."
         )
     return "[" + ",".join(f"{float(value):.10f}" for value in values) + "]"
+
+
+def _sanitize_section_records(
+    records: list[SectionRecord],
+) -> tuple[list[SectionRecord], dict[str, int]]:
+    """Remove unsupported text bytes from section rows before PostgreSQL writes."""
+    nul_byte_count = 0
+    sanitized_records: list[SectionRecord] = []
+    for record in records:
+        doc_id, doc_nuls = _strip_nul_bytes_with_count(record.doc_id)
+        node_id, node_nuls = _strip_nul_bytes_with_count(record.node_id)
+        title, title_nuls = _strip_nul_bytes_with_count(record.title)
+        summary, summary_nuls = _strip_nul_bytes_with_count(record.summary)
+        nul_byte_count += doc_nuls + node_nuls + title_nuls + summary_nuls
+        sanitized_records.append(
+            replace(
+                record,
+                doc_id=doc_id,
+                node_id=node_id,
+                title=title,
+                summary=summary,
+            )
+        )
+    return sanitized_records, {"nul_byte_count": nul_byte_count}
+
+
+def _sanitize_chunk_records(
+    records: list[ChunkRecord],
+) -> tuple[list[ChunkRecord], dict[str, int]]:
+    """Remove unsupported text bytes from chunk rows before PostgreSQL writes."""
+    nul_byte_count = 0
+    sanitized_records: list[ChunkRecord] = []
+    for record in records:
+        doc_id, doc_nuls = _strip_nul_bytes_with_count(record.doc_id)
+        node_id, node_nuls = _strip_nul_bytes_with_count(record.node_id)
+        title, title_nuls = _strip_nul_bytes_with_count(record.title)
+        title_path, title_path_nuls = _strip_nul_bytes_with_count(record.title_path)
+        chunk_text, chunk_text_nuls = _strip_nul_bytes_with_count(record.chunk_text)
+        search_text, search_text_nuls = _strip_nul_bytes_with_count(record.search_text)
+        nul_byte_count += (
+            doc_nuls
+            + node_nuls
+            + title_nuls
+            + title_path_nuls
+            + chunk_text_nuls
+            + search_text_nuls
+        )
+        sanitized_records.append(
+            replace(
+                record,
+                doc_id=doc_id,
+                node_id=node_id,
+                title=title,
+                title_path=title_path,
+                chunk_text=chunk_text,
+                search_text=search_text,
+                text_hash=build_text_hash(chunk_text),
+            )
+        )
+    return sanitized_records, {"nul_byte_count": nul_byte_count}
+
+
+def _strip_nul_bytes(text: str) -> str:
+    """Remove PostgreSQL-incompatible NUL bytes from one text field."""
+    return str(text or "").replace("\x00", "")
+
+
+def _strip_nul_bytes_with_count(text: str) -> tuple[str, int]:
+    """Remove NUL bytes and return how many were stripped."""
+    normalized = str(text or "")
+    nul_count = normalized.count("\x00")
+    return normalized.replace("\x00", ""), nul_count

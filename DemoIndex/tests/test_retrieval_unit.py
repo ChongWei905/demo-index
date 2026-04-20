@@ -7,7 +7,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from DemoIndex import env as demo_env
 from DemoIndex.retrieval import (
@@ -29,6 +29,7 @@ from DemoIndex.retrieval import (
     _build_stage3_candidate_pool,
     _build_stage4_context_sections,
     _build_evidence_items,
+    _create_retrieval_chat_client,
     _derive_search_terms,
     _fuse_chunk_hits,
     _label_evidence_items_with_llm,
@@ -42,6 +43,22 @@ from DemoIndex.retrieval import (
 
 class RetrievalUnitTests(unittest.TestCase):
     """Cover parsing, fusion, aggregation, and Stage 3 helpers."""
+
+    def test_retrieval_chat_client_disables_thinking_by_default(self) -> None:
+        """Retrieval-side chat clients should disable thinking mode by default."""
+        with patch("DemoIndex.retrieval.QwenChatClient") as mock_client_cls:
+            _create_retrieval_chat_client(
+                primary_model="dashscope/qwen3.6-plus",
+                fallback_model="dashscope/qwen3.5-plus",
+                debug_recorder=None,
+            )
+        mock_client_cls.assert_called_once_with(
+            primary_model="dashscope/qwen3.6-plus",
+            fallback_model="dashscope/qwen3.5-plus",
+            enable_thinking=False,
+            strip_thinking_field=True,
+            debug_recorder=None,
+        )
 
     def test_parse_query_rule_based_mixed_language(self) -> None:
         """Generic parsing should extract language, intent, terms, and time scope."""
@@ -426,7 +443,7 @@ class RetrievalUnitTests(unittest.TestCase):
             patch("DemoIndex.retrieval.resolve_database_url", return_value="postgresql://unused"),
             patch("DemoIndex.retrieval.QwenChatClient") as mock_client_cls,
         ):
-            mock_client_cls.return_value.completion.side_effect = RuntimeError("boom")
+            mock_client_cls.return_value.acompletion = AsyncMock(side_effect=RuntimeError("boom"))
             result = localize_sections(stage12, mode="hybrid", top_k_tree_sections_per_doc=2)
         self.assertTrue(result.localized_docs)
         self.assertEqual(result.localized_docs[0].mode_used, "heuristic")

@@ -19,6 +19,13 @@ def compare_tree(*args: Any, **kwargs: Any) -> dict:
     return _compare_tree(*args, **kwargs)
 
 
+def benchmark_pdf_strategies(*args: Any, **kwargs: Any) -> dict:
+    """Benchmark multiple PDF build strategies and compare them with official trees."""
+    from .benchmark import benchmark_pdf_strategies as _benchmark_pdf_strategies
+
+    return _benchmark_pdf_strategies(*args, **kwargs)
+
+
 def parse_query(*args: Any, **kwargs: Any):
     """Parse one retrieval query into a structured understanding object."""
     from .retrieval import parse_query as _parse_query
@@ -71,6 +78,7 @@ def retrieve_evidence(*args: Any, **kwargs: Any):
 __all__ = [
     "build_pageindex_tree",
     "compare_tree",
+    "benchmark_pdf_strategies",
     "parse_query",
     "retrieve_candidates",
     "localize_sections",

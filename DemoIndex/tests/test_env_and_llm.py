@@ -174,6 +174,22 @@ class EnvAndLLMTests(unittest.TestCase):
         self.assertEqual(config.retrieval.stage3_relation_priors["anchor"], 5.0)
         self.assertEqual(config.retrieval.stage3_relation_priors["sibling"], 1.75)
 
+    def test_build_pdf_strategy_is_parsed_from_env(self) -> None:
+        """Build config should parse the PDF strategy enum from DemoIndex/.env."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env_path = Path(tmp_dir) / ".env"
+            env_path.write_text(
+                "DEMOINDEX_BUILD_PDF_STRATEGY=pageindex_native",
+                encoding="utf-8",
+            )
+            with (
+                patch.object(demo_env, "DEMOINDEX_ENV_PATH", env_path),
+                patch.object(demo_env, "load_dotenv", side_effect=_load_dotenv_for_test),
+                patch.dict("os.environ", {}, clear=True),
+            ):
+                config = demo_env.get_demoindex_config()
+        self.assertEqual(config.build.pdf_strategy, "pageindex_native")
+
     def test_retrieve_candidates_uses_env_defaults_and_explicit_args_win(self) -> None:
         """Retrieval entrypoints should resolve env defaults only when args are omitted."""
         sentinel = object()
